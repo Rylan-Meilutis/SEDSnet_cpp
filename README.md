@@ -61,6 +61,9 @@ That runs:
   schema/codegen driver
 - `docs/`
   mirrored public-facing module documentation adapted from the Rust repo
+- `examples/`
+  buildable C ABI examples matching upstream runtime config, time sync,
+  routing, and managed-variable/E2E topics
 
 ## Status
 

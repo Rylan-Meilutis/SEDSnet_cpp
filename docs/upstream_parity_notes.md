@@ -61,6 +61,9 @@ pass is `../sedsnet/C-Headers/sedsnet.h` plus the C/C++ wrapper headers in
 - Static JSON config is now only runtime seeding. Default builds no longer need
   a repository-local application schema, and test schemas live under
   `tests/schemas/`.
+- Local C ABI examples now mirror upstream example topics for runtime
+  configuration, time sync, routing, managed variables, and optional E2E crypto
+  provider hooks.
 
 ## Feature gaps needing explicit behavior
 

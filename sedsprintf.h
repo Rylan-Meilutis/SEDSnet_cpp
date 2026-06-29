@@ -32,22 +32,30 @@ typedef enum SedsDataType {
   SEDS_DT_DISCOVERY_TIMESYNC_SOURCES = 8,
   /* Full board-topology discovery advertisement (boards, endpoints, and connections). */
   SEDS_DT_DISCOVERY_TOPOLOGY = 9,
-  /* Internal reliable-delivery acknowledgement (type, seq). */
-  SEDS_DT_RELIABLE_ACK = 1,
-  /* Internal reliable-delivery selective acknowledgement (type, seq). */
-  SEDS_DT_RELIABLE_PARTIAL_ACK = 3,
-  /* Internal reliable-delivery retransmit request (type, seq). */
-  SEDS_DT_RELIABLE_PACKET_REQUEST = 2,
+  /* Runtime schema snapshot advertisement. */
+  SEDS_DT_DISCOVERY_SCHEMA = 10,
+  /* Discovery request for current topology snapshot. */
+  SEDS_DT_DISCOVERY_TOPOLOGY_REQUEST = 11,
+  /* Discovery request for current runtime schema snapshot. */
+  SEDS_DT_DISCOVERY_SCHEMA_REQUEST = 12,
+  /* Request the latest cached value for a managed variable data type. */
+  SEDS_DT_MANAGED_VARIABLE_REQUEST = 13,
+  /* Reserved managed variable value control type. Values replay as their original data type. */
+  SEDS_DT_MANAGED_VARIABLE_VALUE = 14,
+  /* SEDSnet discovery leave announcement. */
+  SEDS_DT_DISCOVERY_LEAVE = 15,
+  /* Per-link compact transport capability advertisement. */
+  SEDS_DT_DISCOVERY_LINK_CAPABILITIES = 16,
   /* Built-in TelemetryError */
   SEDS_DT_TELEMETRY_ERROR = 0,
 } SedsDataType;
 
 typedef enum SedsDataEndpoint {
-  /* Time sync routing endpoint (always forwarded). */
+  /* SEDSnet time sync routing endpoint (internal, always forwarded). */
   SEDS_EP_TIME_SYNC = 200,
-  /* Discovery control endpoint for internal route advertisements. */
+  /* SEDSnet discovery control endpoint for internal route advertisements. */
   SEDS_EP_DISCOVERY = 201,
-  /* Built-in TelemetryError endpoint */
+  /* SEDSnet error endpoint for internal error packets. */
   SEDS_EP_TELEMETRY_ERROR = 202,
 } SedsDataEndpoint;
 
@@ -72,21 +80,33 @@ typedef enum SedsResult {
   SEDS_INVALID_LINK_ID = -17,
   SEDS_PACKET_TOO_LARGE = -18,
 } SedsResult;
-
-#define SEDS_E2E_PREFER_OFF 0U
-#define SEDS_E2E_PREFER_ON 1U
-#define SEDS_E2E_REQUIRE_ON 2U
-#define SEDS_ROUTER_E2E_DISABLED 0U
-#define SEDS_ROUTER_E2E_REQUIRED_ONLY 1U
-#define SEDS_ROUTER_E2E_PREFERRED 2U
-#define SEDS_ROUTER_E2E_FORCE_ALL 3U
-
 /* ======================================================================== */
 typedef uint64_t (* SedsNowMsFn)(void * user);
 
 typedef struct SedsRouter SedsRouter;
 
 typedef struct SedsRelay SedsRelay;
+
+typedef struct SedsName
+{
+    const char * ptr;
+    size_t len;
+} SedsName;
+
+typedef struct SedsTypeRef
+{
+    SedsDataType id;
+} SedsTypeRef;
+
+typedef struct SedsEndpointRef
+{
+    SedsDataEndpoint id;
+} SedsEndpointRef;
+
+typedef struct SedsSideRef
+{
+    int32_t id;
+} SedsSideRef;
 
 typedef struct SedsRuntimeMemoryConfig
 {
@@ -111,6 +131,31 @@ typedef struct SedsRuntimeTuningConfig
     size_t reliable_max_end_to_end_ack_cache;
 } SedsRuntimeTuningConfig;
 
+#define SEDS_NAME_LITERAL(s_) ((SedsName){ (s_), sizeof(s_) - 1U })
+#define SEDS_NAME_NULL ((SedsName){ NULL, 0U })
+#define SEDS_TYPE_REF(id_) ((SedsTypeRef){ (SedsDataType)(id_) })
+#define SEDS_ENDPOINT_REF(id_) ((SedsEndpointRef){ (SedsDataEndpoint)(id_) })
+#define SEDS_SIDE_REF(id_) ((SedsSideRef){ (int32_t)(id_) })
+#define SEDS_SIDE_INVALID ((SedsSideRef){ -1 })
+
+#define SEDS_E2E_PREFER_OFF 0U
+#define SEDS_E2E_PREFER_ON 1U
+#define SEDS_E2E_REQUIRE_ON 2U
+#define SEDS_ROUTER_E2E_DISABLED 0U
+#define SEDS_ROUTER_E2E_REQUIRED_ONLY 1U
+#define SEDS_ROUTER_E2E_PREFERRED 2U
+#define SEDS_ROUTER_E2E_FORCE_ALL 3U
+
+static inline SedsName seds_name_cstr(const char * s)
+{
+    return (SedsName){ s, s ? strlen(s) : 0U };
+}
+
+static inline bool seds_side_is_valid(SedsSideRef side)
+{
+    return side.id >= 0;
+}
+
 typedef struct SedsPacketView
 {
     uint32_t ty;
@@ -126,6 +171,69 @@ typedef struct SedsPacketView
     const uint8_t * payload;
     size_t payload_len;
 } SedsPacketView;
+
+typedef struct SedsP2pMessageView
+{
+    const char * source_hostname;
+    size_t source_hostname_len;
+    uint32_t source_address;
+    uint16_t source_port;
+    uint16_t destination_port;
+    const uint8_t * payload;
+    size_t payload_len;
+} SedsP2pMessageView;
+
+#define SEDS_P2P_STREAM_ACCEPTED 1U
+#define SEDS_P2P_STREAM_CONNECTED 2U
+#define SEDS_P2P_STREAM_DATA 3U
+#define SEDS_P2P_STREAM_CLOSED 4U
+#define SEDS_P2P_STREAM_RESET 5U
+
+typedef struct SedsP2pStreamEventView
+{
+    uint8_t kind;
+    uint32_t stream_id;
+    uint32_t peer_stream_id;
+    uint32_t sequence;
+    const char * peer_hostname;
+    size_t peer_hostname_len;
+    uint32_t peer_address;
+    uint16_t local_port;
+    uint16_t peer_port;
+    const uint8_t * payload;
+    size_t payload_len;
+} SedsP2pStreamEventView;
+
+typedef struct SedsEndpointInfo
+{
+    bool exists;
+    uint32_t id;
+    bool link_local_only;
+    const char * name;
+    size_t name_len;
+    const char * description;
+    size_t description_len;
+} SedsEndpointInfo;
+
+typedef struct SedsDataTypeInfo
+{
+    bool exists;
+    uint32_t id;
+    bool is_static;
+    size_t element_count;
+    uint8_t message_data_type;
+    uint8_t message_class;
+    uint8_t reliable;
+    uint8_t priority;
+    uint8_t e2e_encryption;
+    size_t fixed_size;
+    const uint32_t * endpoints;
+    size_t num_endpoints;
+    const char * name;
+    size_t name_len;
+    const char * description;
+    size_t description_len;
+} SedsDataTypeInfo;
 
 typedef struct SedsNetworkTime
 {
@@ -168,24 +276,44 @@ typedef enum SedsRouteSelectionMode
     Seds_RSM_Failover = 2,
 } SedsRouteSelectionMode;
 
+typedef enum SedsSideTransportProfile
+{
+    SEDS_SIDE_TRANSPORT_PROFILE_CANONICAL = 0,
+    SEDS_SIDE_TRANSPORT_PROFILE_TEMPLATE = 1,
+    SEDS_SIDE_TRANSPORT_PROFILE_IPV6_LIKE = 2,
+    SEDS_SIDE_TRANSPORT_PROFILE_IPV4_LIKE = 3,
+} SedsSideTransportProfile;
+
+typedef enum SedsLinkCapabilityFlags
+{
+    SEDS_LINK_CAPABILITY_HEADER_TEMPLATES = 0x00000001U,
+    SEDS_LINK_CAPABILITY_CHUNKING = 0x00000002U,
+    SEDS_LINK_CAPABILITY_RELIABILITY = 0x00000004U,
+    SEDS_LINK_CAPABILITY_CRYPTO = 0x00000008U,
+    SEDS_LINK_CAPABILITY_END_TO_END_RELIABILITY = 0x00000010U,
+    SEDS_LINK_CAPABILITY_OMIT_UNCHANGED_TIMESTAMPS = 0x00000020U,
+} SedsLinkCapabilityFlags;
+
 
 typedef SedsResult (* SedsTransmitFn)(const uint8_t * bytes, size_t len, void * user);
 
 typedef SedsResult (* SedsEndpointHandlerFn)(const SedsPacketView * pkt, void * user);
 
 typedef SedsResult (* SedsSerializedHandlerFn)(const uint8_t * bytes, size_t len, void * user);
+typedef SedsSerializedHandlerFn SedsPackedHandlerFn;
+typedef SedsResult (* SedsP2pHandlerFn)(const SedsP2pMessageView * msg, void * user);
+typedef SedsResult (* SedsP2pStreamHandlerFn)(const SedsP2pStreamEventView * event, void * user);
 
 typedef struct SedsLocalEndpointDesc
 {
     uint32_t endpoint;
     SedsEndpointHandlerFn packet_handler; /* optional */
-    SedsSerializedHandlerFn serialized_handler; /* optional */
+    union {
+        SedsSerializedHandlerFn serialized_handler; /* optional, legacy name */
+        SedsPackedHandlerFn packed_handler; /* optional, upstream name */
+    };
     void * user;
 } SedsLocalEndpointDesc;
-
-/* =================================================================
-   Public ABI wrappers *AUTOGENERATED FROM RUST C ABI*
-   ================================================================= */
 
 /** @brief Legacy byte logger without timestamp or queue flag. */
 SedsResult seds_router_log_bytes(SedsRouter * r, SedsDataType ty, const uint8_t * data, size_t len);
@@ -236,7 +364,7 @@ int32_t seds_pkt_header_string_len(const SedsPacketView * pkt);
 int32_t seds_pkt_to_string_len(const SedsPacketView * pkt);
 
 /** @brief Return required buffer length for formatting an error code string. */
-int32_t seds_error_to_string_len(int32_t error_code);
+int32_t seds_error_to_string_len(const int32_t error_code);
 
 /** @brief Format only packet header fields into @p buf. */
 SedsResult seds_pkt_header_string(const SedsPacketView * pkt, char * buf, size_t buf_len);
@@ -308,6 +436,44 @@ SedsResult seds_router_set_sender(SedsRouter * r, const char * sender, size_t se
 SedsResult seds_router_set_sender_id(SedsRouter * r, const char * sender, size_t sender_len);
 SedsResult seds_router_current_address(SedsRouter * r, uint32_t * out_address);
 SedsResult seds_router_configure_address(SedsRouter * r, uint8_t address_mode, uint32_t requested_address);
+SedsResult seds_router_resolve_hostname_address(SedsRouter * r,
+                                                const char * hostname,
+                                                size_t hostname_len,
+                                                uint32_t * out_address);
+SedsResult seds_router_bind_p2p_port(SedsRouter * r, uint16_t port, SedsP2pHandlerFn cb, void * user);
+SedsResult seds_router_clear_p2p_port(SedsRouter * r, uint16_t port);
+SedsResult seds_router_send_p2p_to_hostname(SedsRouter * r,
+                                            const char * hostname,
+                                            size_t hostname_len,
+                                            uint16_t dst_port,
+                                            uint16_t src_port,
+                                            const uint8_t * payload,
+                                            size_t payload_len);
+SedsResult seds_router_send_p2p_to_address(SedsRouter * r,
+                                           uint32_t address,
+                                           uint16_t dst_port,
+                                           uint16_t src_port,
+                                           const uint8_t * payload,
+                                           size_t payload_len);
+SedsResult seds_router_bind_p2p_stream_port(SedsRouter * r, uint16_t port, SedsP2pStreamHandlerFn cb, void * user);
+SedsResult seds_router_clear_p2p_stream_port(SedsRouter * r, uint16_t port);
+SedsResult seds_router_open_p2p_stream_to_hostname(SedsRouter * r,
+                                                   const char * hostname,
+                                                   size_t hostname_len,
+                                                   uint16_t dst_port,
+                                                   uint16_t src_port,
+                                                   uint32_t * out_stream_id);
+SedsResult seds_router_open_p2p_stream_to_address(SedsRouter * r,
+                                                  uint32_t address,
+                                                  uint16_t dst_port,
+                                                  uint16_t src_port,
+                                                  uint32_t * out_stream_id);
+SedsResult seds_router_send_p2p_stream(SedsRouter * r,
+                                       uint32_t stream_id,
+                                       const uint8_t * payload,
+                                       size_t payload_len);
+SedsResult seds_router_close_p2p_stream(SedsRouter * r, uint32_t stream_id);
+SedsResult seds_router_reset_p2p_stream(SedsRouter * r, uint32_t stream_id);
 
 /**
  * @brief Read the router's current internally-synthesized network time in Unix milliseconds.
@@ -360,6 +526,7 @@ SedsResult seds_router_poll_timesync(SedsRouter * r, bool * out_did_queue);
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_announce_discovery(SedsRouter * r);
+SedsResult seds_router_announce_leave(SedsRouter * r);
 
 /**
  * @brief Poll the router's internal discovery runtime and queue any due discovery traffic.
@@ -371,6 +538,25 @@ SedsResult seds_router_announce_discovery(SedsRouter * r);
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_poll_discovery(SedsRouter * r, bool * out_did_queue);
+
+SedsResult seds_router_enable_managed_variable(SedsRouter * r, SedsDataType ty);
+SedsResult seds_router_enable_network_variable(SedsRouter * r, SedsDataType ty, bool can_read, bool can_write);
+SedsResult seds_router_on_network_variable_update(SedsRouter * r,
+                                                  SedsDataType ty,
+                                                  SedsEndpointHandlerFn cb,
+                                                  void * user);
+void seds_router_disable_managed_variable(SedsRouter * r, SedsDataType ty);
+SedsResult seds_router_request_managed_variable(SedsRouter * r, SedsDataType ty);
+SedsResult seds_router_set_network_variable_packed(SedsRouter * r, const uint8_t * bytes, size_t len);
+SedsResult seds_router_seed_managed_variable_packed(SedsRouter * r, const uint8_t * bytes, size_t len);
+int32_t seds_router_cached_managed_variable_packed_len(SedsRouter * r, SedsDataType ty);
+int32_t seds_router_get_network_variable_packed_len(SedsRouter * r, SedsDataType ty, uint32_t stale_after_ms);
+int32_t seds_router_cached_managed_variable_packed(SedsRouter * r, SedsDataType ty, uint8_t * out, size_t out_len);
+int32_t seds_router_get_network_variable_packed(SedsRouter * r,
+                                                SedsDataType ty,
+                                                uint32_t stale_after_ms,
+                                                uint8_t * out,
+                                                size_t out_len);
 
 /**
  * @brief Return required buffer length for a JSON discovery-topology snapshot.
@@ -388,6 +574,16 @@ int32_t seds_router_export_topology_len(SedsRouter * r);
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_router_export_topology(SedsRouter * r, char * buf, size_t buf_len);
+int32_t seds_router_export_client_stats_len(SedsRouter * r, const char * sender, size_t sender_len);
+SedsResult seds_router_export_client_stats(SedsRouter * r,
+                                           const char * sender,
+                                           size_t sender_len,
+                                           char * buf,
+                                           size_t buf_len);
+int32_t seds_router_export_runtime_stats_len(SedsRouter * r);
+SedsResult seds_router_export_runtime_stats(SedsRouter * r, char * buf, size_t buf_len);
+int32_t seds_router_export_memory_layout_len(SedsRouter * r);
+SedsResult seds_router_export_memory_layout(SedsRouter * r, char * buf, size_t buf_len);
 
 /**
  * @brief Run one router maintenance cycle.
@@ -511,6 +707,35 @@ int32_t seds_router_add_side_serialized(
     void * tx_user,
     bool reliable_enabled
 );
+int32_t seds_router_add_side_packed(
+    SedsRouter * r,
+    const char * name,
+    size_t name_len,
+    SedsTransmitFn tx,
+    void * tx_user,
+    bool reliable_enabled
+);
+int32_t seds_router_add_side_packed_small_packets(
+    SedsRouter * r,
+    const char * name,
+    size_t name_len,
+    SedsTransmitFn tx,
+    void * tx_user,
+    bool reliable_enabled,
+    size_t max_frame_bytes
+);
+int32_t seds_router_add_side_packed_profile(
+    SedsRouter * r,
+    const char * name,
+    size_t name_len,
+    SedsTransmitFn tx,
+    void * tx_user,
+    bool reliable_enabled,
+    SedsSideTransportProfile profile,
+    size_t max_frame_bytes,
+    size_t compact_header_target_bytes,
+    size_t max_side_transport_templates
+);
 
 /** @brief Add a packet-view TX side. Returns side id or negative SedsResult. */
 int32_t seds_router_add_side_packet(
@@ -533,6 +758,10 @@ SedsResult seds_router_set_side_egress_enabled(SedsRouter * r, int32_t side_id, 
 
 /** @brief Mark a router side as link-local-capable for link-local-only endpoint traffic. */
 SedsResult seds_router_set_side_link_local_enabled(SedsRouter * r, int32_t side_id, bool enabled);
+SedsResult seds_router_note_side_link_probe_sample(SedsRouter * r,
+                                                   int32_t side_id,
+                                                   size_t bytes,
+                                                   uint64_t duration_ms);
 
 /**
  * @brief Override whether traffic from @p src_side_id may be routed to @p dst_side_id.
@@ -564,6 +793,54 @@ SedsResult seds_router_clear_route_priority(SedsRouter * r, int32_t src_side_id,
  * @return size (>=0) on success; negative SedsResult on error (e.g., invalid type).
  */
 int32_t seds_dtype_expected_size(SedsDataType ty);
+bool seds_endpoint_exists(uint32_t endpoint);
+bool seds_dtype_exists(uint32_t ty);
+SedsResult seds_endpoint_register(uint32_t endpoint, const char * name, size_t name_len, bool link_local_only);
+SedsResult seds_endpoint_register_ex(uint32_t endpoint,
+                                     const char * name,
+                                     size_t name_len,
+                                     const char * description,
+                                     size_t description_len,
+                                     bool link_local_only);
+SedsResult seds_dtype_register(uint32_t ty,
+                               const char * name,
+                               size_t name_len,
+                               bool is_static,
+                               size_t element_count,
+                               uint8_t message_data_type,
+                               uint8_t message_class,
+                               uint8_t reliable,
+                               uint8_t priority,
+                               const uint32_t * endpoints,
+                               size_t num_endpoints);
+SedsResult seds_dtype_register_ex(uint32_t ty,
+                                  const char * name,
+                                  size_t name_len,
+                                  const char * description,
+                                  size_t description_len,
+                                  bool is_static,
+                                  size_t element_count,
+                                  uint8_t message_data_type,
+                                  uint8_t message_class,
+                                  uint8_t reliable,
+                                  uint8_t priority,
+                                  const uint32_t * endpoints,
+                                  size_t num_endpoints);
+SedsResult seds_dtype_set_e2e_encryption_policy(uint32_t ty, uint8_t policy);
+SedsResult seds_schema_register_json_bytes(const uint8_t * json, size_t json_len);
+SedsResult seds_schema_register_json_file(const char * path, size_t path_len);
+SedsResult seds_endpoint_get_info(uint32_t endpoint, SedsEndpointInfo * out);
+SedsResult seds_endpoint_get_info_by_name(const char * name, size_t name_len, SedsEndpointInfo * out);
+SedsResult seds_dtype_get_info(uint32_t ty, uint32_t * endpoints_out, size_t endpoints_cap, SedsDataTypeInfo * out);
+SedsResult seds_dtype_get_info_by_name(const char * name,
+                                       size_t name_len,
+                                       uint32_t * endpoints_out,
+                                       size_t endpoints_cap,
+                                       SedsDataTypeInfo * out);
+SedsResult seds_endpoint_remove(uint32_t endpoint);
+SedsResult seds_endpoint_remove_by_name(const char * name, size_t name_len);
+SedsResult seds_dtype_remove(uint32_t ty);
+SedsResult seds_dtype_remove_by_name(const char * name, size_t name_len);
 
 /* ==============================
    NEW: unified logging entry points
@@ -610,6 +887,7 @@ SedsResult seds_router_log_string_ex(SedsRouter * r,
 
 /** @brief Receive serialized packet bytes immediately (non-queued). */
 SedsResult seds_router_receive_serialized(SedsRouter * r, const uint8_t * bytes, size_t len);
+SedsResult seds_router_receive_packed(SedsRouter * r, const uint8_t * bytes, size_t len);
 
 /** @brief Receive a packet view immediately (non-queued). */
 SedsResult seds_router_receive(SedsRouter * r, const SedsPacketView * view);
@@ -625,15 +903,18 @@ SedsResult seds_router_transmit_message_queue(SedsRouter * r, const SedsPacketVi
 
 /** @brief Enqueue serialized bytes for TX processing. */
 SedsResult seds_router_transmit_serialized_message_queue(SedsRouter * r, const uint8_t * bytes, size_t len);
+SedsResult seds_router_transmit_packed_message_queue(SedsRouter * r, const uint8_t * bytes, size_t len);
 
 /** @brief Transmit serialized bytes immediately. */
 SedsResult seds_router_transmit_serialized_message(SedsRouter * r, const uint8_t * bytes, size_t len);
+SedsResult seds_router_transmit_packed_message(SedsRouter * r, const uint8_t * bytes, size_t len);
 
 /** @brief Process RX queue until empty. */
 SedsResult seds_router_process_rx_queue(SedsRouter * r);
 
 /** @brief Enqueue serialized bytes for RX processing. */
 SedsResult seds_router_rx_serialized_packet_to_queue(SedsRouter * r, const uint8_t * bytes, size_t len);
+SedsResult seds_router_rx_packed_packet_to_queue(SedsRouter * r, const uint8_t * bytes, size_t len);
 
 /** @brief Enqueue a packet view for RX processing. */
 SedsResult seds_router_rx_packet_to_queue(SedsRouter * r, const SedsPacketView * view);
@@ -662,6 +943,8 @@ SedsResult seds_router_clear_tx_queue(SedsRouter * r);
 /** @brief Immediate receive with explicit ingress side id. */
 SedsResult seds_router_receive_serialized_from_side(
     SedsRouter* r, uint32_t side_id, const uint8_t* bytes, size_t len);
+SedsResult seds_router_receive_packed_from_side(
+    SedsRouter* r, uint32_t side_id, const uint8_t* bytes, size_t len);
 
 /** @brief Immediate packet receive with explicit ingress side id. */
 SedsResult seds_router_receive_from_side(
@@ -669,6 +952,8 @@ SedsResult seds_router_receive_from_side(
 
 /** @brief Enqueue serialized receive with explicit ingress side id. */
 SedsResult seds_router_rx_serialized_packet_to_queue_from_side(
+    SedsRouter* r, uint32_t side_id, const uint8_t* bytes, size_t len);
+SedsResult seds_router_rx_packed_packet_to_queue_from_side(
     SedsRouter* r, uint32_t side_id, const uint8_t* bytes, size_t len);
 
 /** @brief Enqueue packet receive with explicit ingress side id. */
@@ -751,14 +1036,17 @@ SedsResult seds_pkt_get_typed(const SedsPacketView * pkt,
 
 /** @brief Return required serialized length for @p view. */
 int32_t seds_pkt_serialize_len(const SedsPacketView * view);
+int32_t seds_pkt_pack_len(const SedsPacketView * view);
 
 /** @brief Serialize packet view into @p out. */
 int32_t seds_pkt_serialize(const SedsPacketView * view, uint8_t * out, size_t out_len);
+int32_t seds_pkt_pack(const SedsPacketView * view, uint8_t * out, size_t out_len);
 
 typedef struct SedsOwnedPacket SedsOwnedPacket;
 
 /** @brief Deserialize bytes into an owned packet object. */
 SedsOwnedPacket * seds_pkt_deserialize_owned(const uint8_t * bytes, size_t len);
+SedsOwnedPacket * seds_pkt_unpack_owned(const uint8_t * bytes, size_t len);
 
 /** @brief Convert owned packet into borrowed packet view fields. */
 SedsResult seds_owned_pkt_view(const SedsOwnedPacket * pkt, SedsPacketView * out_view);
@@ -768,11 +1056,13 @@ void seds_owned_pkt_free(SedsOwnedPacket * pkt);
 
 /** @brief Validate serialized packet bytes. */
 SedsResult seds_pkt_validate_serialized(const uint8_t * bytes, size_t len);
+SedsResult seds_pkt_validate_packed(const uint8_t * bytes, size_t len);
 
 typedef struct SedsOwnedHeader SedsOwnedHeader;
 
 /** @brief Deserialize only packet header fields into an owned header object. */
 SedsOwnedHeader * seds_pkt_deserialize_header_owned(const uint8_t * bytes, size_t len);
+SedsOwnedHeader * seds_pkt_unpack_header_owned(const uint8_t * bytes, size_t len);
 
 /** @brief Convert owned header into borrowed packet-view-compatible fields. */
 SedsResult seds_owned_header_view(const SedsOwnedHeader * h, SedsPacketView * out_view);
@@ -801,6 +1091,7 @@ SedsRelay * seds_relay_new_with_memory(SedsNowMsFn now_ms_cb,
  * @brief Destroy a relay previously returned by seds_relay_new().
  */
 void seds_relay_free(SedsRelay * r);
+SedsResult seds_relay_set_sender_id(SedsRelay * r, const char * sender, size_t sender_len);
 
 /**
  * @brief Queue a built-in discovery advertisement immediately for this relay.
@@ -808,6 +1099,7 @@ void seds_relay_free(SedsRelay * r);
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_relay_announce_discovery(SedsRelay * r);
+SedsResult seds_relay_announce_leave(SedsRelay * r);
 
 /**
  * @brief Poll the relay's internal discovery runtime and queue any due discovery traffic.
@@ -832,6 +1124,16 @@ int32_t seds_relay_export_topology_len(SedsRelay * r);
  * Requires a build with the `discovery` feature.
  */
 SedsResult seds_relay_export_topology(SedsRelay * r, char * buf, size_t buf_len);
+int32_t seds_relay_export_client_stats_len(SedsRelay * r, const char * sender, size_t sender_len);
+SedsResult seds_relay_export_client_stats(SedsRelay * r,
+                                          const char * sender,
+                                          size_t sender_len,
+                                          char * buf,
+                                          size_t buf_len);
+int32_t seds_relay_export_runtime_stats_len(SedsRelay * r);
+SedsResult seds_relay_export_runtime_stats(SedsRelay * r, char * buf, size_t buf_len);
+int32_t seds_relay_export_memory_layout_len(SedsRelay * r);
+SedsResult seds_relay_export_memory_layout(SedsRelay * r, char * buf, size_t buf_len);
 
 /**
  * @brief Run one relay maintenance cycle.
@@ -863,6 +1165,29 @@ int32_t seds_relay_add_side_serialized(SedsRelay * r,
                             SedsTransmitFn tx,
                             void * tx_user,
                             bool reliable_enabled);
+int32_t seds_relay_add_side_packed(SedsRelay * r,
+                            const char * name,
+                            size_t name_len,
+                            SedsTransmitFn tx,
+                            void * tx_user,
+                            bool reliable_enabled);
+int32_t seds_relay_add_side_packed_small_packets(SedsRelay * r,
+                            const char * name,
+                            size_t name_len,
+                            SedsTransmitFn tx,
+                            void * tx_user,
+                            bool reliable_enabled,
+                            size_t max_frame_bytes);
+int32_t seds_relay_add_side_packed_profile(SedsRelay * r,
+                            const char * name,
+                            size_t name_len,
+                            SedsTransmitFn tx,
+                            void * tx_user,
+                            bool reliable_enabled,
+                            SedsSideTransportProfile profile,
+                            size_t max_frame_bytes,
+                            size_t compact_header_target_bytes,
+                            size_t max_side_transport_templates);
 
 /**
  * @brief Add a new side/network to the relay whose TX callback receives packets.
@@ -892,6 +1217,10 @@ SedsResult seds_relay_remove_side(SedsRelay * r, int32_t side_id);
 SedsResult seds_relay_set_side_ingress_enabled(SedsRelay * r, int32_t side_id, bool enabled);
 SedsResult seds_relay_set_side_egress_enabled(SedsRelay * r, int32_t side_id, bool enabled);
 SedsResult seds_relay_set_side_link_local_enabled(SedsRelay * r, int32_t side_id, bool enabled);
+SedsResult seds_relay_note_side_link_probe_sample(SedsRelay * r,
+                                                  int32_t side_id,
+                                                  size_t bytes,
+                                                  uint64_t duration_ms);
 SedsResult seds_relay_set_route(SedsRelay * r, int32_t src_side_id, int32_t dst_side_id, bool enabled);
 SedsResult seds_relay_clear_route(SedsRelay * r, int32_t src_side_id, int32_t dst_side_id);
 SedsResult seds_relay_set_typed_route(SedsRelay * r, int32_t src_side_id, uint32_t ty, int32_t dst_side_id, bool enabled);
@@ -921,6 +1250,10 @@ SedsResult seds_relay_rx_serialized_from_side(SedsRelay * r,
                                               uint32_t side_id,
                                               const uint8_t * bytes,
                                               size_t len);
+SedsResult seds_relay_rx_packed_from_side(SedsRelay * r,
+                                          uint32_t side_id,
+                                          const uint8_t * bytes,
+                                          size_t len);
 
 
 /**
@@ -985,6 +1318,141 @@ SedsResult seds_relay_process_tx_queue_with_timeout(SedsRelay * r, uint32_t time
  */
 SedsResult seds_relay_process_all_queues_with_timeout(SedsRelay * r, uint32_t timeout_ms);
 
+
+static inline SedsResult seds_type_ref_by_name(SedsName name, SedsTypeRef * out)
+{
+    SedsDataTypeInfo info;
+    SedsResult result;
+    if (!out) {
+        return SEDS_BAD_ARG;
+    }
+    result = seds_dtype_get_info_by_name(name.ptr, name.len, NULL, 0U, &info);
+    if (result != SEDS_OK || !info.exists) {
+        return result != SEDS_OK ? result : SEDS_INVALID_TYPE;
+    }
+    out->id = (SedsDataType)info.id;
+    return SEDS_OK;
+}
+
+static inline SedsResult seds_endpoint_ref_by_name(SedsName name, SedsEndpointRef * out)
+{
+    SedsEndpointInfo info;
+    SedsResult result;
+    if (!out) {
+        return SEDS_BAD_ARG;
+    }
+    result = seds_endpoint_get_info_by_name(name.ptr, name.len, &info);
+    if (result != SEDS_OK || !info.exists) {
+        return result != SEDS_OK ? result : SEDS_BAD_ARG;
+    }
+    out->id = (SedsDataEndpoint)info.id;
+    return SEDS_OK;
+}
+
+static inline bool seds_type_ref_exists(SedsTypeRef ty)
+{
+    return seds_dtype_exists((uint32_t)ty.id);
+}
+
+static inline bool seds_endpoint_ref_exists(SedsEndpointRef endpoint)
+{
+    return seds_endpoint_exists((uint32_t)endpoint.id);
+}
+
+static inline int32_t seds_type_ref_expected_size(SedsTypeRef ty)
+{
+    return seds_dtype_expected_size(ty.id);
+}
+
+#if defined(SEDS_ENABLE_CRYPTOGRAPHY)
+typedef SedsResult (* SedsCryptoSealFn)(
+    uint32_t key_id,
+    const uint8_t * nonce,
+    size_t nonce_len,
+    const uint8_t * aad,
+    size_t aad_len,
+    const uint8_t * plaintext,
+    size_t plaintext_len,
+    uint8_t * ciphertext_out,
+    size_t ciphertext_cap,
+    size_t * ciphertext_len_out,
+    uint8_t * tag_out,
+    size_t tag_cap,
+    size_t * tag_len_out,
+    void * user);
+
+typedef SedsResult (* SedsCryptoOpenFn)(
+    uint32_t key_id,
+    const uint8_t * nonce,
+    size_t nonce_len,
+    const uint8_t * aad,
+    size_t aad_len,
+    const uint8_t * ciphertext,
+    size_t ciphertext_len,
+    const uint8_t * tag,
+    size_t tag_len,
+    uint8_t * plaintext_out,
+    size_t plaintext_cap,
+    size_t * plaintext_len_out,
+    void * user);
+
+typedef struct SedsManagedCredentialInfo
+{
+    uint64_t subject_id;
+    uint32_t key_id;
+    uint64_t epoch;
+    uint64_t not_before_ms;
+    uint64_t not_after_ms;
+    uint32_t permissions;
+} SedsManagedCredentialInfo;
+
+SedsResult seds_crypto_register_provider(SedsCryptoSealFn seal, SedsCryptoOpenFn open, void * user);
+void seds_crypto_clear_provider(void);
+SedsResult seds_crypto_register_software_key(uint32_t key_id, const uint8_t * key, size_t key_len);
+void seds_crypto_clear_software_keys(void);
+SedsResult seds_crypto_issue_managed_credential(const uint8_t * root_key,
+                                                size_t root_key_len,
+                                                uint64_t subject_id,
+                                                uint32_t key_id,
+                                                uint64_t epoch,
+                                                uint64_t not_before_ms,
+                                                uint64_t not_after_ms,
+                                                uint32_t permissions,
+                                                uint8_t * out,
+                                                size_t out_cap,
+                                                size_t * out_len);
+SedsResult seds_crypto_verify_managed_credential(const uint8_t * root_key,
+                                                 size_t root_key_len,
+                                                 const uint8_t * credential,
+                                                 size_t credential_len,
+                                                 uint64_t now_ms,
+                                                 SedsManagedCredentialInfo * out_info);
+SedsResult seds_crypto_seal(uint32_t key_id,
+                            const uint8_t * nonce,
+                            size_t nonce_len,
+                            const uint8_t * aad,
+                            size_t aad_len,
+                            const uint8_t * plaintext,
+                            size_t plaintext_len,
+                            uint8_t * ciphertext_out,
+                            size_t ciphertext_cap,
+                            size_t * ciphertext_len_out,
+                            uint8_t * tag_out,
+                            size_t tag_cap,
+                            size_t * tag_len_out);
+SedsResult seds_crypto_open(uint32_t key_id,
+                            const uint8_t * nonce,
+                            size_t nonce_len,
+                            const uint8_t * aad,
+                            size_t aad_len,
+                            const uint8_t * ciphertext,
+                            size_t ciphertext_len,
+                            const uint8_t * tag,
+                            size_t tag_len,
+                            uint8_t * plaintext_out,
+                            size_t plaintext_cap,
+                            size_t * plaintext_len_out);
+#endif
 
 #ifdef __cplusplus
 } /* extern "C" */

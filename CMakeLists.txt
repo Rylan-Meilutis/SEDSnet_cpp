@@ -31,6 +31,7 @@ option(SEDSNET_PREFER_DYNAMIC "Prefer dynamic linking for host builds when suppo
 option(SEDSNET_FORCE_RELEASE "Build release profile even when parent CMake build is Debug" OFF)
 option(SEDSNET_ENABLE_C_WRAPPER "Build the optional native C wrapper target sedsnet::c_wrapper" OFF)
 option(SEDSNET_ENABLE_CPP_WRAPPER "Expose the optional C++ convenience target sedsnet::cpp_wrapper" OFF)
+option(SEDSNET_ENABLE_EXAMPLES "Build SEDSnet example programs" OFF)
 option(SEDSNET_ENABLE_CRYPTOGRAPHY "Enable cryptography provider APIs and define SEDS_ENABLE_CRYPTOGRAPHY" ON)
 if(NOT SEDSNET_MAX_QUEUE_BUDGET AND SEDSNET_MAX_QUEUE_SIZE)
   set(SEDSNET_MAX_QUEUE_BUDGET "${SEDSNET_MAX_QUEUE_SIZE}")
@@ -51,7 +52,7 @@ endif()
 if(SEDSNET_IPC_SCHEMA_PATH)
   set(SEDSPRINTF_IPC_SCHEMA_PATH "${SEDSNET_IPC_SCHEMA_PATH}" CACHE STRING "Optional path to IPC overlay schema JSON" FORCE)
 endif()
-set(SEDSPRINTF_HEADER_TEMPLATE "${CMAKE_CURRENT_SOURCE_DIR}/header_templates/sedsprintf.h.txt")
+set(SEDSPRINTF_HEADER_BASE "${CMAKE_CURRENT_SOURCE_DIR}/sedsprintf.h")
 set(SEDSPRINTF_ABI_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/sedsprintf.h" CACHE STRING "Header source used to extract ABI declarations and result enum")
 option(SEDSPRINTF_ENABLE_TIMESYNC "Enable built-in time sync schema generation" ON)
 option(SEDSPRINTF_ENABLE_DISCOVERY "Enable built-in discovery schema generation" ON)
@@ -67,7 +68,7 @@ if(NOT SEDSPRINTF_EFFECTIVE_SCHEMA_PATH AND SEDSNET_ENABLE_TESTS)
 endif()
 
 set(SEDSPRINTF_CODEGEN_ARGS
-    --header-template "${SEDSPRINTF_HEADER_TEMPLATE}"
+    --header-base "${SEDSPRINTF_HEADER_BASE}"
     --header-out "${SEDSPRINTF_GENERATED_HEADER}"
     --public-header-out "${SEDSNET_GENERATED_HEADER}"
     --schema-out "${SEDSPRINTF_GENERATED_SCHEMA_HPP}"
@@ -78,7 +79,7 @@ set(SEDSPRINTF_CODEGEN_ARGS
 )
 set(SEDSPRINTF_CODEGEN_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_schema.py"
-    "${SEDSPRINTF_HEADER_TEMPLATE}"
+    "${SEDSPRINTF_HEADER_BASE}"
     "${SEDSPRINTF_ABI_SOURCE}"
 )
 if(SEDSPRINTF_EFFECTIVE_SCHEMA_PATH)
@@ -167,6 +168,31 @@ if(SEDSNET_ENABLE_CPP_WRAPPER)
   add_library(sedsnet::cpp_wrapper ALIAS sedsnet_cpp_wrapper)
 endif()
 
+if(SEDSNET_ENABLE_EXAMPLES)
+  add_executable(sedsnet_runtime_config_example examples/runtime_config_example.c)
+  target_link_libraries(sedsnet_runtime_config_example PRIVATE sedsprintf_cpp)
+
+  add_executable(sedsnet_timesync_example examples/timesync_example.c)
+  target_link_libraries(sedsnet_timesync_example PRIVATE sedsprintf_cpp)
+
+  add_executable(sedsnet_routing_example examples/routing_example.c)
+  target_link_libraries(sedsnet_routing_example PRIVATE sedsprintf_cpp)
+
+  if(NOT TARGET sedsnet_c_wrapper)
+    add_library(sedsnet_c_wrapper STATIC c-wrapper/sedsnet_c_wrapper.c)
+    target_link_libraries(sedsnet_c_wrapper PUBLIC sedsprintf_cpp)
+    target_include_directories(sedsnet_c_wrapper PUBLIC
+      ${SEDSPRINTF_C_HEADER_DIR}
+      ${CMAKE_CURRENT_SOURCE_DIR}/c-wrapper
+    )
+    if(SEDSNET_ENABLE_CRYPTOGRAPHY)
+      target_compile_definitions(sedsnet_c_wrapper PUBLIC SEDS_ENABLE_CRYPTOGRAPHY=1)
+    endif()
+  endif()
+  add_executable(sedsnet_managed_variables_e2e_example examples/managed_variables_e2e_example.c)
+  target_link_libraries(sedsnet_managed_variables_e2e_example PRIVATE sedsnet_c_wrapper)
+endif()
+
 if(SEDSNET_ENABLE_TESTS)
 find_package(GTest REQUIRED)
 include(GoogleTest)
@@ -190,7 +216,7 @@ set(SEDSNET_OVERLAY_GENERATED_HEADER "${SEDSPRINTF_OVERLAY_C_HEADER_DIR}/sedsnet
 set(SEDSPRINTF_OVERLAY_GENERATED_SCHEMA_HPP "${SEDSPRINTF_OVERLAY_CPP_HEADER_DIR}/generated_schema.hpp")
 set(SEDSPRINTF_OVERLAY_CODEGEN_ARGS
     --ipc-schema "${SEDSPRINTF_OVERLAY_SCHEMA_PATH}"
-    --header-template "${SEDSPRINTF_HEADER_TEMPLATE}"
+    --header-base "${SEDSPRINTF_HEADER_BASE}"
     --header-out "${SEDSPRINTF_OVERLAY_GENERATED_HEADER}"
     --public-header-out "${SEDSNET_OVERLAY_GENERATED_HEADER}"
     --schema-out "${SEDSPRINTF_OVERLAY_GENERATED_SCHEMA_HPP}"
@@ -202,7 +228,7 @@ set(SEDSPRINTF_OVERLAY_CODEGEN_ARGS
 set(SEDSPRINTF_OVERLAY_CODEGEN_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/scripts/generate_schema.py"
     "${SEDSPRINTF_OVERLAY_SCHEMA_PATH}"
-    "${SEDSPRINTF_HEADER_TEMPLATE}"
+    "${SEDSPRINTF_HEADER_BASE}"
     "${SEDSPRINTF_ABI_SOURCE}"
 )
 if(SEDSPRINTF_EFFECTIVE_SCHEMA_PATH)

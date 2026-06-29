@@ -7,9 +7,6 @@ import re
 from pathlib import Path
 
 
-HEADER_ENUMS_MARKER = "/* {{AUTOGEN:ENUMS}} */"
-HEADER_ABI_MARKER = "/* {{AUTOGEN:ABI}} */"
-
 RUST_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ALL_CAPS_RE = re.compile(r"^[A-Z0-9_]+$")
 
@@ -155,7 +152,7 @@ ERROR_TYPE = {
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--schema")
-    p.add_argument("--header-template", required=True)
+    p.add_argument("--header-base", required=True)
     p.add_argument("--header-out", required=True)
     p.add_argument("--public-header-out")
     p.add_argument("--schema-out", required=True)
@@ -546,12 +543,23 @@ def render_generated_schema(cfg: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_header(template_path: Path, out_path: Path, cfg: dict, *, abi_text: str, result_members: list[tuple[str, int]],
+def replace_enum_block(text: str, enums: str) -> str:
+    pattern = (
+        r"typedef\s+enum\s+SedsDataType\s*\{.*?\}\s*SedsDataType;\s*"
+        r"typedef\s+enum\s+SedsDataEndpoint\s*\{.*?\}\s*SedsDataEndpoint;\s*"
+        r"typedef\s+enum\s+SedsResult\s*\{.*?\}\s*SedsResult;"
+    )
+    updated, count = re.subn(pattern, enums, text, count=1, flags=re.S)
+    if count != 1:
+        raise ValueError("could not replace public enum block in base header")
+    return updated
+
+
+def write_header(base_path: Path, out_path: Path, cfg: dict, *, result_members: list[tuple[str, int]],
                  public_builtins: bool = False) -> None:
-    text = template_path.read_text(encoding="utf-8")
+    text = base_path.read_text(encoding="utf-8")
     enums = render_public_builtin_enums(result_members) if public_builtins else render_c_enums(cfg, result_members)
-    text = text.replace(HEADER_ENUMS_MARKER, enums)
-    text = text.replace(HEADER_ABI_MARKER, abi_text)
+    text = replace_enum_block(text, enums)
     if public_builtins:
         text = text.replace("SEDSPRINTF_C_H", "SEDSNET_C_H")
         text = re.sub(
@@ -582,21 +590,18 @@ def main() -> None:
         timesync_enabled=timesync_enabled,
         discovery_enabled=discovery_enabled,
     )
-    abi_text = parse_abi_block(Path(args.abi_source) if args.abi_source else None)
     result_members = parse_seds_result(Path(args.result_source) if args.result_source else None)
     write_header(
-        Path(args.header_template),
+        Path(args.header_base),
         Path(args.header_out),
         schema,
-        abi_text=abi_text,
         result_members=result_members,
     )
     if args.public_header_out:
         write_header(
-            Path(args.header_template),
+            Path(args.header_base),
             Path(args.public_header_out),
             schema,
-            abi_text=abi_text,
             result_members=result_members,
             public_builtins=True,
         )

@@ -12,6 +12,7 @@ Main responsibilities:
 Public entrypoints:
 - C ABI in `sedsprintf.h`
 - C++ wrappers in `src/packet.hpp`, `src/router.hpp`, `src/relay.hpp`, `src/discovery.hpp`, and `src/timesync.hpp`
+- Buildable examples in `examples/`, summarized in [examples.md](examples.md)
 
 Non-goals in this repo:
 - Rust FFI implementation
