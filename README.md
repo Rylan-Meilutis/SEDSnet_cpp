@@ -52,6 +52,40 @@ That runs:
 - `ctest`
 - codegen verification
 
+## Use From CMake
+
+Consumers can pull this repository directly at CMake configure time with
+`FetchContent`, avoiding a checked-in submodule:
+
+```cmake
+include(FetchContent)
+
+set(SEDSNET_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+set(SEDSNET_ENABLE_C_WRAPPER ON CACHE BOOL "" FORCE) # optional
+set(SEDSNET_ENABLE_CPP_WRAPPER ON CACHE BOOL "" FORCE) # optional
+
+FetchContent_Declare(
+  sedsnet_cpp
+  GIT_REPOSITORY https://github.com/Rylan-Meilutis/SEDSnet_cpp.git
+  GIT_TAG <commit-sha-or-release-tag>
+)
+
+FetchContent_MakeAvailable(sedsnet_cpp)
+
+target_link_libraries(my_app PRIVATE sedsnet::sedsnet)
+# Optional wrapper targets, when enabled above:
+# target_link_libraries(my_app PRIVATE sedsnet::c_wrapper)
+# target_link_libraries(my_app PRIVATE sedsnet::cpp_wrapper)
+```
+
+Application code can then include the public ABI header:
+
+```c
+#include "sedsnet.h"
+```
+
+Pin `GIT_TAG` to a commit SHA until this repository publishes release tags.
+
 ## Layout
 
 - `src/`
