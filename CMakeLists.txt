@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
-project(sedsprintf_cpp LANGUAGES C CXX)
+project(sedsprintf_cpp VERSION 4.0.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
+set(SEDSNET_CPP_VERSION "${PROJECT_VERSION}" CACHE STRING "SEDSnet C++ port version")
 
 find_path(ZSTD_INCLUDE_DIR zstd.h HINTS /opt/homebrew/include /usr/local/include /usr/include)
 find_library(ZSTD_LIBRARY zstd HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)

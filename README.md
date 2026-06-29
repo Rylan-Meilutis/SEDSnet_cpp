@@ -2,6 +2,9 @@
 
 C++ port of `sedsprintf_rs`, focused on the transport/runtime layers and the generated C ABI.
 
+Version metadata is declared in `CMakeLists.txt` and `vcpkg.json`. The current
+C++ port version is `4.0.1`, matching the documented upstream parity point.
+
 This repo provides:
 - schema-driven telemetry packet types and endpoint metadata
 - packet serialization / deserialization helpers

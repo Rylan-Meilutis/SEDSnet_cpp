@@ -1,0 +1,8 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "sedsnet-cpp",
+  "version-string": "4.0.1",
+  "description": "C++ port of SEDSnet with the upstream C ABI, runtime schema, routing, reliability, discovery, time sync, managed variables, P2P, and optional wrapper targets.",
+  "homepage": "https://github.com/rylan-meilutis/SEDSnet_cpp",
+  "license": "GPL-2.0-only"
+}
