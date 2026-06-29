@@ -19,7 +19,9 @@ public:
     static Packet from_view(const SedsPacketView& view);
     static std::optional<Packet> deserialize(std::span<const uint8_t> bytes);
     static Packet from_f32_slice(uint32_t ty, std::span<const float> values, std::vector<uint32_t> endpoints,
-                                 uint64_t timestamp, std::string sender = "CPP");
+                                 uint64_t timestamp);
+    static Packet from_f32_slice(uint32_t ty, std::span<const float> values, std::vector<uint32_t> endpoints,
+                                 uint64_t timestamp, std::string sender);
 
     [[nodiscard]] uint32_t type() const { return ty_; }
     [[nodiscard]] const std::vector<uint32_t>& endpoints() const { return endpoints_; }

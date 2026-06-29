@@ -67,6 +67,7 @@ namespace seds
     std::unordered_map<uint64_t, int32_t> expected_end_to_end_destinations(const SedsRouter & r, const PacketData & pkt)
     {
       std::unordered_map<uint64_t, int32_t> out;
+      const size_t cap = runtime_reliable_max_end_to_end_pending();
       const uint64_t now_ms = r.now_ms();
       const bool require_link_local = packet_requires_link_local(pkt);
       for (const auto & [side_id, route]: r.discovery_routes)
@@ -96,6 +97,10 @@ namespace seds
             if (board_matches_any_endpoint(board, pkt.endpoints))
             {
               out[sender_hash(board.sender_id)] = side_id;
+              if (out.size() >= cap)
+              {
+                return out;
+              }
               matched_board = true;
             }
           }
@@ -106,6 +111,10 @@ namespace seds
               if (sender_state.endpoints.contains(ep))
               {
                 out[sender_hash(sender)] = side_id;
+                if (out.size() >= cap)
+                {
+                  return out;
+                }
                 break;
               }
             }
@@ -113,6 +122,52 @@ namespace seds
         }
       }
       return out;
+    }
+
+    template<typename OwnerT>
+    void remember_reliable_return_route(OwnerT & owner, uint64_t packet_id)
+    {
+      const size_t cap = std::max<size_t>(1, runtime_reliable_max_return_routes());
+      std::erase(owner.reliable_return_route_order, packet_id);
+      while (owner.reliable_return_route_order.size() >= cap)
+      {
+        const uint64_t oldest = owner.reliable_return_route_order.front();
+        owner.reliable_return_route_order.pop_front();
+        owner.reliable_return_routes.erase(oldest);
+      }
+      owner.reliable_return_route_order.push_back(packet_id);
+    }
+
+    void remember_end_to_end_reliable_tx(SedsRouter & r, uint64_t packet_id)
+    {
+      const size_t cap = std::max<size_t>(1, runtime_reliable_max_end_to_end_pending());
+      std::erase(r.end_to_end_reliable_tx_order, packet_id);
+      while (r.end_to_end_reliable_tx_order.size() >= cap)
+      {
+        const uint64_t oldest = r.end_to_end_reliable_tx_order.front();
+        r.end_to_end_reliable_tx_order.pop_front();
+        r.end_to_end_reliable_tx.erase(oldest);
+      }
+      r.end_to_end_reliable_tx_order.push_back(packet_id);
+    }
+
+    void note_end_to_end_acked_destination(SedsRelay & relay, uint64_t packet_id, uint64_t sender_hash)
+    {
+      const size_t entry_cap = std::max<size_t>(1, runtime_reliable_max_end_to_end_ack_cache());
+      std::erase(relay.end_to_end_acked_destination_order, packet_id);
+      while (relay.end_to_end_acked_destination_order.size() >= entry_cap)
+      {
+        const uint64_t oldest = relay.end_to_end_acked_destination_order.front();
+        relay.end_to_end_acked_destination_order.pop_front();
+        relay.end_to_end_acked_destinations.erase(oldest);
+      }
+      relay.end_to_end_acked_destination_order.push_back(packet_id);
+      auto & senders = relay.end_to_end_acked_destinations[packet_id];
+      const size_t sender_cap = std::max<size_t>(1, runtime_reliable_max_end_to_end_pending());
+      if (senders.size() < sender_cap || senders.contains(sender_hash))
+      {
+        senders.insert(sender_hash);
+      }
     }
 
     std::vector<int32_t> filter_end_to_end_satisfied_sides(const SedsRelay & owner, const PacketData & pkt,
@@ -282,7 +337,7 @@ namespace seds
                                                       control_sender(owner)),
                          std::nullopt,
                          side_id, false
-                       });
+                       }, owner.memory.max_queue_budget);
     }
 
     template<typename OwnerT>
@@ -303,7 +358,7 @@ namespace seds
                          make_reliable_control_packet(SEDS_DT_RELIABLE_PACKET_REQUEST, ty, seq, owner.now_ms(),
                                                       control_sender(owner)),
                          std::nullopt, side_id, false
-                       });
+                       }, owner.memory.max_queue_budget);
     }
 
     template<typename OwnerT>
@@ -323,7 +378,7 @@ namespace seds
                          make_reliable_control_packet(SEDS_DT_RELIABLE_PARTIAL_ACK, ty, seq, owner.now_ms(),
                                                       control_sender(owner)),
                          std::nullopt, side_id, false
-                       });
+                       }, owner.memory.max_queue_budget);
     }
 
     void queue_end_to_end_ack(SedsRouter & r, const PacketData & pkt, std::optional<int32_t> src_side)
@@ -333,7 +388,7 @@ namespace seds
                        {
                          make_e2e_reliable_ack_packet(packet_id(pkt), r.now_ms(), sender),
                          std::nullopt, src_side, false
-                       });
+                       }, r.memory.max_queue_budget);
       const uint64_t source_id = source_packet_id(pkt);
       // Rust source routers may track multi-endpoint packets in schema endpoint order, while
       // relays route ACKs by the wire-decoded endpoint order. Emit both IDs when they differ.
@@ -343,7 +398,7 @@ namespace seds
                          {
                            make_e2e_reliable_ack_packet(source_id, r.now_ms(), sender),
                            std::nullopt, src_side, false
-                         });
+                         }, r.memory.max_queue_budget);
       }
     }
 
@@ -357,6 +412,12 @@ namespace seds
       }
 
       const auto & hdr = *frame.reliable;
+
+      if ((hdr.flags & kReliableFlagAckOnly) != 0u)
+      {
+        handle_ack_impl(owner, side_id, frame.envelope.ty, hdr.ack);
+        return false;
+      }
 
       if ((hdr.flags & kReliableFlagUnsequenced) != 0u)
       {
@@ -380,7 +441,7 @@ namespace seds
 
       if (hdr.seq > rx.expected_seq)
       {
-        if (rx.buffered.size() < kReliableMaxPending)
+        if (rx.buffered.size() < runtime_reliable_max_pending())
         {
           rx.buffered.emplace(hdr.seq, ReliableRxState::Buffered{pkt, {wire_bytes.begin(), wire_bytes.end()}});
         }
@@ -429,7 +490,7 @@ namespace seds
       }
       auto key = reliable_key(side_id, pkt.ty);
       auto & tx = owner.reliable_tx[key];
-      if (tx.sent.size() >= kReliableMaxPending)
+      if (tx.sent.size() >= runtime_reliable_max_pending())
       {
         return SEDS_PACKET_TOO_LARGE;
       }
@@ -471,11 +532,11 @@ namespace seds
         {
           auto sent = tx.sent.find(seq);
           if (sent == tx.sent.end() || sent->second.queued || sent->second.partial_acked ||
-              now - sent->second.last_send_ms < kReliableRetransmitMs)
+              now - sent->second.last_send_ms < runtime_reliable_retransmit_ms())
           {
             continue;
           }
-          if (sent->second.retries >= kReliableMaxRetries)
+          if (sent->second.retries >= runtime_reliable_max_retries())
           {
             tx.sent.erase(sent);
             std::erase(tx.sent_order, seq);
@@ -498,8 +559,7 @@ namespace seds
     {
       return;
     }
-    constexpr size_t kRecentCap = 128;
-    if (r.recent_ids.size() >= kRecentCap)
+    if (r.recent_ids.size() >= r.memory.max_recent_rx_ids)
     {
       r.recent_set.erase(r.recent_ids.front());
       r.recent_ids.pop_front();
@@ -514,8 +574,7 @@ namespace seds
     {
       return;
     }
-    constexpr size_t kRecentCap = 128;
-    if (r.recent_ids.size() >= kRecentCap)
+    if (r.recent_ids.size() >= r.memory.max_recent_rx_ids)
     {
       r.recent_set.erase(r.recent_ids.front());
       r.recent_ids.pop_front();
@@ -526,11 +585,13 @@ namespace seds
 
   void note_reliable_return_route(SedsRouter & r, const int32_t side_id, const uint64_t packet_id)
   {
+    remember_reliable_return_route(r, packet_id);
     r.reliable_return_routes[packet_id] = ReliableReturnRouteState{side_id};
   }
 
   void note_reliable_return_route(SedsRelay & r, const int32_t side_id, const uint64_t packet_id)
   {
+    remember_reliable_return_route(r, packet_id);
     r.reliable_return_routes[packet_id] = ReliableReturnRouteState{side_id};
   }
 
@@ -620,7 +681,7 @@ namespace seds
       if (local.packet_handler != nullptr)
       {
         int32_t rc = SEDS_OK;
-        for (size_t attempt = 0; attempt < 3; ++attempt)
+        for (size_t attempt = 0; attempt < runtime_max_handler_retries(); ++attempt)
         {
           rc = local.packet_handler(&view, local.user);
           if (rc == SEDS_OK)
@@ -887,7 +948,9 @@ namespace seds
           const auto pending = expected_end_to_end_destinations(owner, item.pkt);
           if (!pending.empty())
           {
-            owner.end_to_end_reliable_tx[packet_id(item.pkt)] =
+            const uint64_t id = packet_id(item.pkt);
+            remember_end_to_end_reliable_tx(owner, id);
+            owner.end_to_end_reliable_tx[id] =
                 EndToEndReliableSent{item.pkt, pending, true, owner.now_ms(), 0, false};
           }
           break;
@@ -988,6 +1051,66 @@ namespace seds
     return SEDS_OK;
   }
 
+  std::optional<uint32_t> decode_managed_request_type(const PacketData & pkt)
+  {
+    if (pkt.payload.size() != sizeof(uint32_t))
+    {
+      return std::nullopt;
+    }
+    uint32_t wire_ty = 0;
+    std::memcpy(&wire_ty, pkt.payload.data(), sizeof(wire_ty));
+    if (const auto local = local_type_from_wire_id(wire_ty); local.has_value())
+    {
+      return *local;
+    }
+    return wire_ty;
+  }
+
+  void remember_managed_variable_packet(SedsRouter & r, const PacketData & pkt, bool invoke_callback)
+  {
+    const auto policy_it = r.managed_variable_policy.find(pkt.ty);
+    if (policy_it == r.managed_variable_policy.end() || !policy_it->second.enabled)
+    {
+      return;
+    }
+    r.managed_variable_latest[pkt.ty] =
+        ManagedVariableEntry{pkt, serialize_packet(pkt), r.now_ms()};
+    if (!invoke_callback)
+    {
+      return;
+    }
+    const auto cb_it = r.managed_variable_callbacks.find(pkt.ty);
+    if (cb_it == r.managed_variable_callbacks.end() || cb_it->second.cb == nullptr)
+    {
+      return;
+    }
+    SedsPacketView view{};
+    fill_view(pkt, view);
+    (void)cb_it->second.cb(&view, cb_it->second.user);
+  }
+
+  bool handle_managed_variable_request(SedsRouter & r, const PacketData & pkt, std::optional<int32_t> src_side)
+  {
+    const uint32_t request_ty = local_type_from_wire_id(13).value_or(1013u);
+    if (pkt.ty != request_ty)
+    {
+      return false;
+    }
+    const auto ty = decode_managed_request_type(pkt);
+    if (!ty)
+    {
+      return true;
+    }
+    const auto latest = r.managed_variable_latest.find(*ty);
+    if (latest == r.managed_variable_latest.end())
+    {
+      return true;
+    }
+    enqueue_tx(r.tx_queue, r.tx_queue_bytes, {latest->second.pkt, std::nullopt, src_side, false},
+               r.memory.max_queue_budget);
+    return true;
+  }
+
   void router_receive_impl(SedsRouter & r, PacketData pkt, std::optional<int32_t> src_side)
   {
     const uint64_t id = packet_id(pkt);
@@ -1049,6 +1172,10 @@ namespace seds
         uint32_t seq = 0;
         std::memcpy(&ty, pkt.payload.data(), sizeof(ty));
         std::memcpy(&seq, pkt.payload.data() + sizeof(ty), sizeof(seq));
+        if (const auto local_ty = local_type_from_wire_id(ty); local_ty.has_value())
+        {
+          ty = *local_ty;
+        }
         if (pkt.ty == SEDS_DT_RELIABLE_ACK)
         {
           handle_ack_impl(r, *src_side, ty, seq);
@@ -1062,6 +1189,15 @@ namespace seds
           handle_packet_request_impl(r, *src_side, ty, seq);
         }
       }
+      return;
+    }
+    if (handle_managed_variable_request(r, pkt, src_side))
+    {
+      return;
+    }
+    if (pkt.ty == local_type_from_wire_id(18).value_or(1018u))
+    {
+      (void)seds_router_dispatch_p2p_packet(r, pkt);
       return;
     }
     if (is_discovery_control_type(pkt.ty))
@@ -1082,13 +1218,15 @@ namespace seds
                  (local.packet_handler != nullptr || local.serialized_handler != nullptr);
         });
     static_cast<void>(dispatch_local_packet_handlers(pkt, r.locals));
+    remember_managed_variable_packet(r, pkt, true);
     if (src_side && had_local_handler && is_reliable_type(pkt.ty))
     {
       queue_end_to_end_ack(r, pkt, src_side);
     }
     if (src_side && r.mode == Seds_RM_Relay)
     {
-      enqueue_tx(r.tx_queue, r.tx_queue_bytes, {std::move(pkt), src_side, std::nullopt, false});
+      enqueue_tx(r.tx_queue, r.tx_queue_bytes, {std::move(pkt), src_side, std::nullopt, false},
+                 r.memory.max_queue_budget);
     }
   }
 
@@ -1114,12 +1252,13 @@ namespace seds
         std::memcpy(&acked_id, pkt.payload.data(), sizeof(acked_id));
         if (const auto ack_sender = decode_end_to_end_ack_sender_hash(pkt.sender); ack_sender.has_value())
         {
-          relay.end_to_end_acked_destinations[acked_id].insert(*ack_sender);
+          note_end_to_end_acked_destination(relay, acked_id, *ack_sender);
         }
         if (const auto it = relay.reliable_return_routes.find(acked_id);
           src_side && it != relay.reliable_return_routes.end())
         {
-          enqueue_tx(relay.tx_queue, relay.tx_queue_bytes, {std::move(pkt), src_side, it->second.side, false});
+          enqueue_tx(relay.tx_queue, relay.tx_queue_bytes, {std::move(pkt), src_side, it->second.side, false},
+                     relay.memory.max_queue_budget);
         }
         return;
       }
@@ -1129,6 +1268,10 @@ namespace seds
         uint32_t seq = 0;
         std::memcpy(&ty, pkt.payload.data(), sizeof(ty));
         std::memcpy(&seq, pkt.payload.data() + sizeof(ty), sizeof(seq));
+        if (const auto local_ty = local_type_from_wire_id(ty); local_ty.has_value())
+        {
+          ty = *local_ty;
+        }
         if (pkt.ty == SEDS_DT_RELIABLE_ACK)
         {
           handle_ack_impl(relay, *src_side, ty, seq);
@@ -1148,7 +1291,8 @@ namespace seds
     {
       handle_discovery_packet(relay, pkt, src_side);
     }
-    enqueue_tx(relay.tx_queue, relay.tx_queue_bytes, {std::move(pkt), src_side, std::nullopt, false});
+    enqueue_tx(relay.tx_queue, relay.tx_queue_bytes, {std::move(pkt), src_side, std::nullopt, false},
+               relay.memory.max_queue_budget);
   }
 
   void process_reliable_timeouts(SedsRouter & r) { do_reliable_timeouts(r); }
@@ -1199,11 +1343,12 @@ namespace seds
       }
       for (const int32_t side: sides)
       {
-        enqueue_tx_front(r.tx_queue, r.tx_queue_bytes, {pkt, std::nullopt, side, false});
+        enqueue_tx_front(r.tx_queue, r.tx_queue_bytes, {pkt, std::nullopt, side, false}, r.memory.max_queue_budget);
       }
       if (!it->second.tracked_destinations)
       {
-        enqueue_tx_front(r.tx_queue, r.tx_queue_bytes, {pkt, std::nullopt, std::nullopt, false});
+        enqueue_tx_front(r.tx_queue, r.tx_queue_bytes, {pkt, std::nullopt, std::nullopt, false},
+                         r.memory.max_queue_budget);
       }
       it->second.last_send_ms = now;
       it->second.queued = false;

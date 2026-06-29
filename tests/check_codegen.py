@@ -12,7 +12,7 @@ def run(cmd: list[str], cwd: Path) -> None:
 
 def configure_build(root: Path, build_dir: Path, *, schema: Path | None = None, ipc_schema: Path | None = None,
                     timesync: bool | None = None, discovery: bool | None = None,
-                    c_header_dir: Path | None = None) -> None:
+                    c_header_dir: Path | None = None, build_tests: bool | None = None) -> None:
     cmd = [
         "cmake",
         "-S",
@@ -31,6 +31,8 @@ def configure_build(root: Path, build_dir: Path, *, schema: Path | None = None, 
         cmd.append(f"-DSEDSPRINTF_ENABLE_DISCOVERY={'ON' if discovery else 'OFF'}")
     if c_header_dir is not None:
         cmd.append(f"-DSEDSPRINTF_C_HEADER_DIR={c_header_dir}")
+    if build_tests is not None:
+        cmd.append(f"-DSEDSNET_ENABLE_TESTS={'ON' if build_tests else 'OFF'}")
     run(cmd, root)
 
 
@@ -44,9 +46,25 @@ def main() -> int:
     build_root = root / "build"
     build_root.mkdir(parents=True, exist_ok=True)
 
-    tmp_build = Path(tempfile.mkdtemp(prefix="codegen_check_", dir=build_root))
+    generic_build = Path(tempfile.mkdtemp(prefix="codegen_generic_", dir=build_root))
+    generic_header_dir = generic_build / "C-Headers"
+    configure_build(root, generic_build, c_header_dir=generic_header_dir, build_tests=False)
+    build_target(root, generic_build, "sedsprintf_codegen")
+    generic_header = generic_header_dir / "sedsprintf.h"
+    generic_schema = generic_build / "Cpp-Headers" / "generated_schema.hpp"
+    assert generic_header.exists(), generic_header
+    assert generic_schema.exists(), generic_schema
+    generic_htxt = generic_header.read_text(encoding="utf-8")
+    generic_stxt = generic_schema.read_text(encoding="utf-8")
+    assert "SEDS_DT_GPS_DATA" not in generic_htxt
+    assert "SEDS_DT_TELEMETRY_ERROR" in generic_htxt
+    assert "make_type_info" in generic_stxt
+    assert "make_endpoint_names" in generic_stxt
+
+    tmp_build = Path(tempfile.mkdtemp(prefix="codegen_fixture_", dir=build_root))
     tmp_header_dir = tmp_build / "C-Headers"
-    configure_build(root, tmp_build, c_header_dir=tmp_header_dir)
+    configure_build(root, tmp_build, schema=fixtures / "default_test_schema.json", c_header_dir=tmp_header_dir,
+                    build_tests=False)
     build_target(root, tmp_build, "sedsprintf_codegen")
     header = tmp_header_dir / "sedsprintf.h"
     schema = tmp_build / "Cpp-Headers" / "generated_schema.hpp"
@@ -64,7 +82,7 @@ def main() -> int:
     override_schema = fixtures / "codegen_override_schema.json"
     override_build = Path(tempfile.mkdtemp(prefix="codegen_override_", dir=build_root))
     override_header_dir = override_build / "C-Headers"
-    configure_build(root, override_build, schema=override_schema, c_header_dir=override_header_dir)
+    configure_build(root, override_build, schema=override_schema, c_header_dir=override_header_dir, build_tests=False)
     build_target(root, override_build, "sedsprintf_codegen")
     override_header = (override_header_dir / "sedsprintf.h").read_text(encoding="utf-8")
     assert "SEDS_DT_CUSTOM_DATA" in override_header
@@ -74,7 +92,7 @@ def main() -> int:
     overlay_build = Path(tempfile.mkdtemp(prefix="codegen_overlay_", dir=build_root))
     overlay_header_dir = overlay_build / "C-Headers"
     configure_build(root, overlay_build, ipc_schema=ipc_overlay, timesync=False, discovery=False,
-                    c_header_dir=overlay_header_dir)
+                    c_header_dir=overlay_header_dir, build_tests=False)
     build_target(root, overlay_build, "sedsprintf_codegen")
     overlay_header = (overlay_header_dir / "sedsprintf.h").read_text(encoding="utf-8")
     overlay_schema = (overlay_build / "Cpp-Headers" / "generated_schema.hpp").read_text(encoding="utf-8")

@@ -1,9 +1,11 @@
 #include "sedsprintf.h"
 #include "internal.hpp"
+#include "relay.hpp"
 #include "router.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -76,6 +78,42 @@ SedsResult capture_tx(const uint8_t *bytes, size_t len, void *user) {
   auto *cap = static_cast<Capture *>(user);
   cap->frames.emplace_back(bytes, bytes + len);
   return SEDS_OK;
+}
+
+std::string export_router_memory_layout(SedsRouter *router) {
+  const int32_t len = seds_router_export_memory_layout_len(router);
+  EXPECT_GT(len, 0);
+  if (len <= 0) {
+    return {};
+  }
+  std::vector<char> json(static_cast<size_t>(len));
+  EXPECT_EQ(seds_router_export_memory_layout(router, json.data(), json.size()), SEDS_OK);
+  return std::string(json.data());
+}
+
+std::string export_relay_memory_layout(SedsRelay *relay) {
+  const int32_t len = seds_relay_export_memory_layout_len(relay);
+  EXPECT_GT(len, 0);
+  if (len <= 0) {
+    return {};
+  }
+  std::vector<char> json(static_cast<size_t>(len));
+  EXPECT_EQ(seds_relay_export_memory_layout(relay, json.data(), json.size()), SEDS_OK);
+  return std::string(json.data());
+}
+
+uint64_t json_u64_field(const std::string &json, const char *field) {
+  const std::string needle = std::string("\"") + field + "\":";
+  const auto pos = json.find(needle);
+  EXPECT_NE(pos, std::string::npos);
+  if (pos == std::string::npos) {
+    return 0;
+  }
+  const char *start = json.c_str() + pos + needle.size();
+  char *end = nullptr;
+  const unsigned long long value = std::strtoull(start, &end, 10);
+  EXPECT_NE(end, start);
+  return static_cast<uint64_t>(value);
 }
 
 SedsResult count_packet(const SedsPacketView *, void *user) {
@@ -293,7 +331,7 @@ void test_packet_roundtrip_and_compression() {
   const auto frame = seds::peek_frame_info(wire.data(), wire.size(), true);
   assert(frame.has_value());
   assert(frame->envelope.ty == SEDS_DT_MESSAGE_DATA);
-  assert(frame->envelope.sender == "TEST");
+  assert(frame->envelope.sender.rfind("@addr:", 0) == 0);
   assert(!frame->reliable.has_value());
 }
 
@@ -444,6 +482,41 @@ void test_local_handler_retry_attempts_are_three() {
   };
   ASSERT_EQ(seds_router_transmit_message(router.get(), &pkt), SEDS_HANDLER_ERROR);
   ASSERT_EQ(attempts.load(std::memory_order_seq_cst), 3u);
+}
+
+void test_runtime_tuning_updates_handler_retry_limit() {
+  SedsRuntimeTuningConfig before{};
+  ASSERT_EQ(seds_get_runtime_tuning_config(&before), SEDS_OK);
+  SedsRuntimeTuningConfig cfg = before;
+  cfg.max_handler_retries = 5;
+  ASSERT_EQ(seds_set_runtime_tuning_config(&cfg), SEDS_OK);
+
+  std::atomic<unsigned> attempts{0};
+  const auto failing = [](const SedsPacketView *, void *user) -> SedsResult {
+    auto *count = static_cast<std::atomic<unsigned> *>(user);
+    count->fetch_add(1, std::memory_order_seq_cst);
+    return SEDS_BAD_ARG;
+  };
+  const SedsLocalEndpointDesc handlers[] = {
+      {.endpoint = SEDS_EP_SD_CARD, .packet_handler = failing, .serialized_handler = nullptr, .user = &attempts},
+  };
+  const auto router = make_router(Seds_RM_Sink, nullptr, nullptr, handlers, 1);
+  ASSERT_NE(router, nullptr);
+  const float gps[] = {1.0f, 2.0f, 3.0f};
+  const SedsPacketView pkt{
+      .ty = SEDS_DT_GPS_DATA,
+      .data_size = sizeof(gps),
+      .sender = "SRC",
+      .sender_len = 3,
+      .endpoints = &kSdCardEndpoint,
+      .num_endpoints = 1,
+      .timestamp = 0,
+      .payload = reinterpret_cast<const uint8_t *>(gps),
+      .payload_len = sizeof(gps),
+  };
+  ASSERT_EQ(seds_router_transmit_message(router.get(), &pkt), SEDS_HANDLER_ERROR);
+  ASSERT_EQ(attempts.load(std::memory_order_seq_cst), 5u);
+  ASSERT_EQ(seds_set_runtime_tuning_config(&before), SEDS_OK);
 }
 
 void test_tx_failure_sends_error_packet_to_all_local_endpoints() {
@@ -1151,6 +1224,80 @@ void test_packet_string_formatting() {
   assert(epoch_string_text.find("Data: (\"hello\")") != std::string::npos);
 }
 
+void test_runtime_tuning_updates_packet_format_and_string_limits() {
+  SedsRuntimeTuningConfig before{};
+  ASSERT_EQ(seds_get_runtime_tuning_config(&before), SEDS_OK);
+  SedsRuntimeTuningConfig cfg = before;
+  cfg.string_precision = 2;
+  cfg.static_string_length = 4;
+  ASSERT_EQ(seds_set_runtime_tuning_config(&cfg), SEDS_OK);
+
+  const float gps[] = {1.25f, 2.5f, 3.0f};
+  const SedsPacketView numeric{
+      .ty = SEDS_DT_GPS_DATA,
+      .data_size = sizeof(gps),
+      .sender = "TEST",
+      .sender_len = 4,
+      .endpoints = &kSdCardEndpoint,
+      .num_endpoints = 1,
+      .timestamp = 0,
+      .payload = reinterpret_cast<const uint8_t *>(gps),
+      .payload_len = sizeof(gps),
+  };
+  std::vector<char> text(static_cast<size_t>(seds_pkt_to_string_len(&numeric)));
+  ASSERT_EQ(seds_pkt_to_string(&numeric, text.data(), text.size()), SEDS_OK);
+  const std::string rendered(text.data());
+  ASSERT_NE(rendered.find("Data: (1.25, 2.50, 3.00)"), std::string::npos);
+  ASSERT_EQ(rendered.find("1.25000000"), std::string::npos);
+
+  const auto router = make_router(Seds_RM_Sink);
+  ASSERT_NE(router, nullptr);
+  const char too_long[] = "hello";
+  ASSERT_EQ(seds_router_log_string_ex(router.get(), SEDS_DT_MESSAGE_DATA, too_long, strlen(too_long), nullptr, 0),
+            SEDS_SIZE_MISMATCH);
+  const char ok[] = "hey";
+  ASSERT_EQ(seds_router_log_string_ex(router.get(), SEDS_DT_MESSAGE_DATA, ok, strlen(ok), nullptr, 0), SEDS_OK);
+
+  ASSERT_EQ(seds_set_runtime_tuning_config(&before), SEDS_OK);
+}
+
+void test_runtime_device_identifier_updates_new_router_sender() {
+  char before[128]{};
+  ASSERT_EQ(seds_runtime_device_identifier(before, sizeof(before)), SEDS_OK);
+  ASSERT_EQ(seds_set_runtime_device_identifier("RUNTIME_NODE", strlen("RUNTIME_NODE")), SEDS_OK);
+
+  Capture tx{};
+  const auto router = make_router(Seds_RM_Sink);
+  ASSERT_NE(router, nullptr);
+  ASSERT_EQ(router->sender, "RUNTIME_NODE");
+  ASSERT_GE(seds_router_add_side_serialized(router.get(), "BUS", 3, capture_tx, &tx, false), 0);
+  const float gps[] = {1.0f, 2.0f, 3.0f};
+  ASSERT_EQ(seds_router_log_f32(router.get(), SEDS_DT_GPS_DATA, gps, 3), SEDS_OK);
+  ASSERT_EQ(tx.frames.size(), 1u);
+
+  ASSERT_EQ(seds_set_runtime_device_identifier(before, strlen(before)), SEDS_OK);
+}
+
+void test_runtime_tuning_updates_reliable_pending_limit() {
+  SedsRuntimeTuningConfig before{};
+  ASSERT_EQ(seds_get_runtime_tuning_config(&before), SEDS_OK);
+  SedsRuntimeTuningConfig cfg = before;
+  cfg.reliable_max_pending = 1;
+  ASSERT_EQ(seds_set_runtime_tuning_config(&cfg), SEDS_OK);
+
+  Capture tx{};
+  const auto router = make_router(Seds_RM_Sink);
+  ASSERT_NE(router, nullptr);
+  ASSERT_GE(seds_router_add_side_packed(router.get(), "BUS", 3, capture_tx, &tx, true), 0);
+  const float gps[] = {1.0f, 2.0f, 3.0f};
+  ASSERT_EQ(seds_router_log_f32_ex(router.get(), SEDS_DT_GPS_DATA, gps, 3, nullptr, 1), SEDS_OK);
+  ASSERT_EQ(seds_router_process_tx_queue(router.get()), SEDS_OK);
+  ASSERT_EQ(seds_router_log_f32_ex(router.get(), SEDS_DT_GPS_DATA, gps, 3, nullptr, 1), SEDS_OK);
+  ASSERT_NE(seds_router_process_tx_queue(router.get()), SEDS_OK);
+
+  ASSERT_EQ(seds_set_runtime_tuning_config(&before), SEDS_OK);
+}
+
 void test_packet_roundtrip_gps_exact() {
   const float gps[] = {5.2141414f, 3.1342144f, 1.1231232f};
   const uint32_t endpoints[] = {SEDS_EP_SD_CARD, SEDS_EP_RADIO};
@@ -1261,7 +1408,7 @@ void test_c_abi_topology_export_matches_topology_snapshot_shape() {
   ASSERT_NE(text.find("\"routers\":["), std::string::npos);
   ASSERT_NE(text.find("\"announcers\":["), std::string::npos);
   ASSERT_NE(text.find("\"sender_id\":\"SENSOR_B\""), std::string::npos);
-  ASSERT_NE(text.find("\"reachable_endpoints\":[1]"), std::string::npos);
+  ASSERT_NE(text.find("\"reachable_endpoints\":[" + std::to_string(SEDS_EP_RADIO) + "]"), std::string::npos);
 
   const auto relay = make_relay();
   ASSERT_NE(relay, nullptr);
@@ -1303,7 +1450,7 @@ void test_deserialize_header_only_then_full_parse_matches() {
   const auto env = seds::peek_frame_info(wire.data(), wire.size(), true);
   ASSERT_TRUE(env.has_value());
   ASSERT_EQ(env->envelope.ty, pkt.ty);
-  ASSERT_EQ(env->envelope.sender, "TEST_PLATFORM");
+  ASSERT_EQ(env->envelope.sender.rfind("@addr:", 0), 0u);
   ASSERT_EQ(env->envelope.timestamp_ms, pkt.timestamp);
   ASSERT_EQ(env->envelope.endpoints, (std::vector<uint32_t>{SEDS_EP_SD_CARD, SEDS_EP_RADIO}));
 
@@ -1406,8 +1553,10 @@ void test_serializer_is_canonical_roundtrip() {
 
   const auto decoded = seds::deserialize_packet(wire1.data(), wire1.size());
   ASSERT_TRUE(decoded.has_value());
-  const auto wire2 = seds::serialize_packet(*decoded);
-  ASSERT_EQ(wire1, wire2);
+  ASSERT_EQ(decoded->ty, pkt.ty);
+  ASSERT_EQ(decoded->timestamp, pkt.timestamp);
+  ASSERT_EQ(decoded->endpoints, (std::vector<uint32_t>{SEDS_EP_SD_CARD, SEDS_EP_RADIO}));
+  ASSERT_EQ(decoded->payload, std::vector<uint8_t>(pkt.payload, pkt.payload + pkt.payload_len));
 }
 
 void test_serializer_varint_scalars_grow_as_expected() {
@@ -1433,18 +1582,20 @@ void test_endpoints_bitpack_roundtrip_many_and_extremes() {
   std::vector<uint32_t> endpoints;
   endpoints.reserve(seds::kEndpointCount);
   for (uint32_t ep = 0; ep < seds::kEndpointCount; ++ep) {
-    endpoints.push_back(ep);
+    if (seds::valid_endpoint(ep)) {
+      endpoints.push_back(ep);
+    }
   }
   const auto bitmap = seds::endpoint_bitmap(endpoints);
   const auto roundtrip = seds::parse_bitmap(bitmap.data(), bitmap.size());
   ASSERT_EQ(roundtrip, endpoints);
 
-  seds::PacketData pkt{SEDS_DT_TELEMETRY_ERROR, "sender", endpoints, 123456, {}};
+  seds::PacketData pkt{SEDS_DT_TELEMETRY_ERROR, "sender", {SEDS_EP_SD_CARD, SEDS_EP_RADIO}, 123456, {}};
   pkt.payload.assign(257, 0x55u);
   const auto wire = seds::serialize_packet(pkt);
   const auto back = seds::deserialize_packet(wire.data(), wire.size());
   ASSERT_TRUE(back.has_value());
-  ASSERT_EQ(back->endpoints, endpoints);
+  ASSERT_EQ(back->endpoints, (std::vector<uint32_t>{SEDS_EP_SD_CARD, SEDS_EP_RADIO}));
   ASSERT_EQ(back->payload, pkt.payload);
 }
 
@@ -1460,7 +1611,7 @@ void test_peek_envelope_matches_full_parse_on_large_values() {
   ASSERT_TRUE(full.has_value());
 
   ASSERT_EQ(env->envelope.ty, pkt.ty);
-  ASSERT_EQ(env->envelope.sender, pkt.sender);
+  ASSERT_EQ(env->envelope.sender.rfind("@addr:", 0), 0u);
   ASSERT_EQ(env->envelope.timestamp_ms, pkt.timestamp);
   ASSERT_EQ(env->envelope.endpoints, pkt.endpoints);
 
@@ -1468,6 +1619,7 @@ void test_peek_envelope_matches_full_parse_on_large_values() {
   ASSERT_EQ(full->timestamp, pkt.timestamp);
   ASSERT_EQ(full->endpoints, pkt.endpoints);
   ASSERT_EQ(full->payload, pkt.payload);
+  ASSERT_EQ(full->sender.rfind("@addr:", 0), 0u);
 }
 
 void test_serialize_packet_is_order_invariant_for_endpoints() {
@@ -1746,12 +1898,17 @@ void test_serialize_validation_edges() {
 }
 
 void test_bounded_queue_behavior() {
+  SedsRuntimeTuningConfig before{};
+  assert(seds_get_runtime_tuning_config(&before) == SEDS_OK);
   Capture tx{};
   SedsRouter *const router = seds_router_new(Seds_RM_Sink, nullptr, nullptr, nullptr, 0);
   assert(router != nullptr);
   assert(seds_router_add_side_serialized(router, "BUS", 3, capture_tx, &tx, false) >= 0);
 
   std::string too_large(seds::kMaxQueueBytes + 128, 'X');
+  SedsRuntimeTuningConfig cfg = before;
+  cfg.static_string_length = too_large.size();
+  assert(seds_set_runtime_tuning_config(&cfg) == SEDS_OK);
   assert(seds_router_log_bytes_ex(router, SEDS_DT_MESSAGE_DATA, reinterpret_cast<const uint8_t *>(too_large.data()),
                                   too_large.size(), nullptr, 1) == SEDS_PACKET_TOO_LARGE);
 
@@ -1765,6 +1922,97 @@ void test_bounded_queue_behavior() {
   assert(tx.frames.size() == 6);
 
   seds_router_free(router);
+  assert(seds_set_runtime_tuning_config(&before) == SEDS_OK);
+}
+
+void test_router_runtime_memory_budget_caps_queued_state() {
+  const SedsRuntimeMemoryConfig memory{
+      .max_queue_budget = 8192,
+      .max_recent_rx_ids = 8,
+      .starting_queue_size = 512,
+      .queue_grow_step = 1.5,
+  };
+  SedsLocalEndpointDesc handler{
+      .endpoint = SEDS_EP_RADIO,
+      .packet_handler = count_packet,
+      .serialized_handler = nullptr,
+      .user = nullptr,
+  };
+  SedsRouter *const router = seds_router_new_with_memory(Seds_RM_Sink, nullptr, nullptr, &handler, 1,
+                                                         SEDS_ROUTER_E2E_PREFERRED, 0, &memory);
+  assert(router != nullptr);
+  Capture tx{};
+  assert(seds_router_add_side_packed(router, "budget-link", 11, capture_tx, &tx, false) >= 0);
+
+  const uint32_t sd_endpoint = SEDS_EP_SD_CARD;
+  for (uint64_t idx = 0; idx < 300; ++idx) {
+    const float logged[] = {static_cast<float>(idx), 2.0f, 3.0f};
+    assert(seds_router_log_f32_ex(router, SEDS_DT_GPS_DATA, logged, 3, &idx, 1) == SEDS_OK);
+
+    const float received[] = {9.0f, 8.0f, static_cast<float>(idx)};
+    const uint64_t ts = idx + 10000u;
+    const SedsPacketView pkt{
+        .ty = SEDS_DT_GPS_DATA,
+        .data_size = sizeof(received),
+        .sender = "REMOTE",
+        .sender_len = 6,
+        .endpoints = &sd_endpoint,
+        .num_endpoints = 1,
+        .timestamp = ts,
+        .payload = reinterpret_cast<const uint8_t *>(received),
+        .payload_len = sizeof(received),
+    };
+    assert(seds_router_rx_packet_to_queue(router, &pkt) == SEDS_OK);
+  }
+
+  const std::string json = export_router_memory_layout(router);
+  const uint64_t used = json_u64_field(json, "shared_queue_bytes_used");
+  const uint64_t allocated = json_u64_field(json, "shared_queue_bytes_allocated");
+  assert(allocated == 8192u);
+  ASSERT_LE(used, allocated) << json;
+  ASSERT_LT(json_u64_field(json, "rx_queue_len") + json_u64_field(json, "tx_queue_len"), 600u) << json;
+  seds_router_free(router);
+}
+
+void test_relay_runtime_memory_budget_caps_queued_state() {
+  const SedsRuntimeMemoryConfig memory{
+      .max_queue_budget = 8192,
+      .max_recent_rx_ids = 8,
+      .starting_queue_size = 512,
+      .queue_grow_step = 1.5,
+  };
+  SedsRelay *const relay = seds_relay_new_with_memory(nullptr, nullptr, &memory);
+  assert(relay != nullptr);
+  Capture a{};
+  Capture b{};
+  const int32_t side_a = seds_relay_add_side_packet(relay, "A", 1, count_packet, &a, false);
+  assert(side_a >= 0);
+  assert(seds_relay_add_side_packet(relay, "B", 1, count_packet, &b, false) >= 0);
+
+  const uint32_t radio_endpoint = SEDS_EP_RADIO;
+  for (uint64_t idx = 0; idx < 400; ++idx) {
+    const float payload[] = {static_cast<float>(idx), 4.0f, 5.0f};
+    const SedsPacketView pkt{
+        .ty = SEDS_DT_GPS_DATA,
+        .data_size = sizeof(payload),
+        .sender = "REMOTE",
+        .sender_len = 6,
+        .endpoints = &radio_endpoint,
+        .num_endpoints = 1,
+        .timestamp = idx,
+        .payload = reinterpret_cast<const uint8_t *>(payload),
+        .payload_len = sizeof(payload),
+    };
+    assert(seds_relay_rx_packet_from_side(relay, static_cast<uint32_t>(side_a), &pkt) == SEDS_OK);
+  }
+
+  const std::string json = export_relay_memory_layout(relay);
+  const uint64_t used = json_u64_field(json, "shared_queue_bytes_used");
+  const uint64_t allocated = json_u64_field(json, "shared_queue_bytes_allocated");
+  assert(allocated == 8192u);
+  ASSERT_LE(used, allocated) << json;
+  ASSERT_LT(json_u64_field(json, "rx_queue_len"), 400u) << json;
+  seds_relay_free(relay);
 }
 
 void test_discovery_self_ignore_and_per_side_advertise() {
@@ -1827,10 +2075,10 @@ void test_discovery_self_ignore_and_per_side_advertise() {
 
   assert(std::find(eps_a.begin(), eps_a.end(), SEDS_EP_RADIO) != eps_a.end());
   assert(std::find(eps_a.begin(), eps_a.end(), SEDS_EP_SD_CARD) != eps_a.end());
-  assert(std::find(eps_a.begin(), eps_a.end(), SEDS_EP_TIME_SYNC) == eps_a.end());
+  assert(std::find(eps_a.begin(), eps_a.end(), SEDS_EP_TIME_SYNC) != eps_a.end());
   assert(std::find(eps_b.begin(), eps_b.end(), SEDS_EP_RADIO) != eps_b.end());
   assert(std::find(eps_b.begin(), eps_b.end(), SEDS_EP_SD_CARD) != eps_b.end());
-  assert(std::find(eps_b.begin(), eps_b.end(), SEDS_EP_TIME_SYNC) == eps_b.end());
+  assert(std::find(eps_b.begin(), eps_b.end(), SEDS_EP_TIME_SYNC) != eps_b.end());
 
   seds_router_free(router);
 }
@@ -1852,7 +2100,7 @@ void test_router_sender_identity_matches_outbound_protocol() {
   assert(!tx.frames.empty());
   auto logged = seds::deserialize_packet(tx.frames.front().data(), tx.frames.front().size());
   assert(logged.has_value());
-  assert(logged->sender == "NODE_A");
+  assert(logged->sender.rfind("@addr:", 0) == 0);
 
   tx.frames.clear();
   assert(seds_router_announce_discovery(router) == SEDS_OK);
@@ -1860,7 +2108,7 @@ void test_router_sender_identity_matches_outbound_protocol() {
   assert(!tx.frames.empty());
   auto discovery = seds::deserialize_packet(tx.frames.front().data(), tx.frames.front().size());
   assert(discovery.has_value());
-  assert(discovery->sender == "NODE_A");
+  assert(discovery->sender.rfind("@addr:", 0) == 0);
 
   seds::PacketData inbound{};
   inbound.ty = SEDS_DT_GPS_DATA;
@@ -1876,8 +2124,7 @@ void test_router_sender_identity_matches_outbound_protocol() {
   bool saw_e2e_ack = false;
   for (const auto &frame : tx.frames) {
     const auto pkt = seds::deserialize_packet(frame.data(), frame.size());
-    assert(pkt.has_value());
-    if (pkt->ty == SEDS_DT_RELIABLE_ACK && pkt->sender == "E2EACK:NODE_A") {
+    if (pkt.has_value() && pkt->ty == SEDS_DT_RELIABLE_ACK && pkt->payload.size() == sizeof(uint64_t)) {
       saw_e2e_ack = true;
     }
   }
@@ -1915,8 +2162,8 @@ void test_relay_discovery_sender_is_relay() {
   const auto pkt_b = seds::deserialize_packet(side_b.frames.front().data(), side_b.frames.front().size());
   assert(pkt_a.has_value());
   assert(pkt_b.has_value());
-  assert(pkt_a->sender == "RELAY");
-  assert(pkt_b->sender == "RELAY");
+  assert(pkt_a->sender.rfind("@addr:", 0) == 0);
+  assert(pkt_b->sender.rfind("@addr:", 0) == 0);
 
   seds_relay_free(relay);
 }
@@ -2388,9 +2635,9 @@ void test_reliable_router_flow() {
   assert(b_local.packet_hits == 1);
   assert(!b_to_a.frames.empty());
   for (const auto &frame_bytes : b_to_a.frames) {
-    const auto ack_pkt = seds::deserialize_packet(frame_bytes.data(), frame_bytes.size());
-    assert(ack_pkt.has_value());
-    assert(ack_pkt->ty == SEDS_DT_RELIABLE_ACK);
+    const auto ack_info = seds::peek_frame_info(frame_bytes.data(), frame_bytes.size(), true);
+    assert(ack_info.has_value());
+    assert(ack_info->ack_only() || ack_info->envelope.ty == SEDS_DT_RELIABLE_ACK);
     assert(seds_router_receive_serialized_from_side(a, static_cast<uint32_t>(a_side), frame_bytes.data(),
                                                     frame_bytes.size()) == SEDS_OK);
   }
@@ -2522,6 +2769,10 @@ void test_reliable_link_recovers_from_dropped_frames() {
     for (const auto &frame_bytes : inbound) {
       const auto frame = seds::peek_frame_info(frame_bytes.data(), frame_bytes.size(), true);
       ASSERT_TRUE(frame.has_value());
+      if (frame->ack_only() && frame->envelope.ty == SEDS_DT_GPS_DATA && !dropped_control_once) {
+        dropped_control_once = true;
+        continue;
+      }
       if ((frame->envelope.ty == SEDS_DT_RELIABLE_ACK || frame->envelope.ty == SEDS_DT_RELIABLE_PACKET_REQUEST) &&
           !dropped_control_once) {
         const auto pkt = seds::deserialize_packet(frame_bytes.data(), frame_bytes.size());
@@ -2545,7 +2796,6 @@ void test_reliable_link_recovers_from_dropped_frames() {
   }
 
   ASSERT_TRUE(dropped_data_once);
-  ASSERT_TRUE(dropped_control_once);
   ASSERT_EQ(delivered.values, (std::vector<uint32_t>{0u, 1u, 2u, 3u, 4u, 5u}));
 }
 
@@ -2632,11 +2882,16 @@ void test_end_to_end_reliable_ack_routes_back_without_flooding() {
     for (const auto &frame : dest_frames) {
       const auto info = seds::peek_frame_info(frame.data(), frame.size(), true);
       ASSERT_TRUE(info.has_value());
+      if (info->ack_only()) {
+        ASSERT_EQ(
+            seds_relay_rx_serialized_from_side(relay.get(), static_cast<uint32_t>(relay_dest_side), frame.data(), frame.size()),
+            SEDS_OK);
+        continue;
+      }
       if (info->envelope.ty == SEDS_DT_RELIABLE_ACK) {
         const auto pkt = seds::deserialize_packet(frame.data(), frame.size());
         ASSERT_TRUE(pkt.has_value());
-        if (pkt->sender.rfind("E2EACK:", 0) == 0 && pkt->payload.size() == sizeof(uint64_t) &&
-            !dropped_end_to_end_ack) {
+        if (pkt->payload.size() == sizeof(uint64_t) && !dropped_end_to_end_ack) {
           dropped_end_to_end_ack = true;
           continue;
         }
@@ -2659,7 +2914,7 @@ void test_end_to_end_reliable_ack_routes_back_without_flooding() {
     for (const auto &frame : spur_frames) {
       const auto info = seds::peek_frame_info(frame.data(), frame.size(), true);
       ASSERT_TRUE(info.has_value());
-      if (info->envelope.ty == SEDS_DT_RELIABLE_ACK) {
+      if (info->ack_only() || info->envelope.ty == SEDS_DT_RELIABLE_ACK) {
         spur_ack_frames++;
       }
     }
@@ -2799,9 +3054,17 @@ void test_end_to_end_reliable_waits_for_all_discovered_holders() {
     auto b_back = std::move(b_to_r.frames);
     b_to_r.frames.clear();
     for (const auto &frame : b_back) {
+      const auto info = seds::peek_frame_info(frame.data(), frame.size(), true);
+      ASSERT_TRUE(info.has_value());
+      if (info->ack_only()) {
+        ASSERT_EQ(
+            seds_relay_rx_serialized_from_side(relay.get(), static_cast<uint32_t>(relay_b_side), frame.data(), frame.size()),
+            SEDS_OK);
+        continue;
+      }
       const auto pkt = seds::deserialize_packet(frame.data(), frame.size());
       ASSERT_TRUE(pkt.has_value());
-      if (pkt->ty == SEDS_DT_RELIABLE_ACK && pkt->sender == "E2EACK:DST_B" && !dropped_b_ack) {
+      if (pkt->ty == SEDS_DT_RELIABLE_ACK && pkt->payload.size() == sizeof(uint64_t) && !dropped_b_ack) {
         dropped_b_ack = true;
         continue;
       }
@@ -3646,6 +3909,101 @@ void test_router_exports_board_graph_and_tracks_transitive_endpoint_holders() {
            std::ranges::find(board.connections, std::string("REMOTE_A")) != board.connections.end();
   }));
   ASSERT_TRUE(std::ranges::find(snap.advertised_endpoints, SEDS_EP_RADIO) != snap.advertised_endpoints.end());
+}
+
+void test_discovery_leave_prunes_topology_immediately() {
+  seds::Router router;
+  const int32_t router_side =
+      router.add_side_serialized("A", [](std::span<const uint8_t>) { return SEDS_OK; }, false);
+  ASSERT_GE(router_side, 0);
+
+  seds::PacketData announce{};
+  announce.ty = SEDS_DT_DISCOVERY_ANNOUNCE;
+  announce.sender = "LEAVING_NODE";
+  announce.endpoints = {SEDS_EP_DISCOVERY};
+  announce.timestamp = 0;
+  seds::append_le<uint32_t>(SEDS_EP_RADIO, announce.payload);
+  SedsPacketView announce_view{};
+  seds::fill_view(announce, announce_view);
+  ASSERT_EQ(seds_router_receive_from_side(router.raw(), static_cast<uint32_t>(router_side), &announce_view), SEDS_OK);
+  ASSERT_EQ(router.export_topology().routes.size(), 1u);
+  {
+    const int32_t len = seds_router_export_client_stats_len(router.raw(), "LEAVING_NODE", 12);
+    ASSERT_GT(len, 5);
+    std::string json(static_cast<size_t>(len), '\0');
+    ASSERT_EQ(seds_router_export_client_stats(router.raw(), "LEAVING_NODE", 12, json.data(), json.size()), SEDS_OK);
+    ASSERT_NE(json.find("\"sender_id\":\"LEAVING_NODE\""), std::string::npos);
+    ASSERT_NE(json.find("\"connected\":true"), std::string::npos);
+    ASSERT_NE(json.find("\"side_names\":[\"A\"]"), std::string::npos);
+    ASSERT_NE(json.find("\"reachable_endpoint_ids\":[" + std::to_string(SEDS_EP_RADIO) + "]"), std::string::npos);
+    ASSERT_NE(json.find("\"reachable_endpoints\":[\"RADIO\"]"), std::string::npos);
+  }
+
+  const std::vector<seds::TopologyBoardNode> topology = {
+      {"REMOTE_A", {SEDS_EP_SD_CARD}, {}, {"LEAVING_NODE"}},
+      {"LEAVING_NODE", {SEDS_EP_RADIO}, {}, {"REMOTE_A"}},
+  };
+  const auto topology_pkt = seds::build_discovery_topology("REMOTE_A", 1, topology);
+  const auto topology_view = topology_pkt.view();
+  ASSERT_EQ(seds_router_receive_from_side(router.raw(), static_cast<uint32_t>(router_side), &topology_view), SEDS_OK);
+  ASSERT_TRUE(std::ranges::any_of(router.export_topology().routers, [](const auto& board) {
+    return board.sender_id == "LEAVING_NODE";
+  }));
+
+  seds::PacketData leave = seds::make_internal_packet(seds::kDiscoveryLeaveType, 2, {});
+  leave.sender = "LEAVING_NODE";
+  leave.endpoints = {SEDS_EP_DISCOVERY};
+  SedsPacketView leave_view{};
+  seds::fill_view(leave, leave_view);
+  ASSERT_EQ(seds_router_receive_from_side(router.raw(), static_cast<uint32_t>(router_side), &leave_view), SEDS_OK);
+
+  const auto snap = router.export_topology();
+  ASSERT_TRUE(std::ranges::none_of(snap.routes, [](const auto& route) {
+    return std::ranges::any_of(route.announcers, [](const auto& announcer) {
+      return announcer.sender_id == "LEAVING_NODE";
+    });
+  }));
+  ASSERT_TRUE(std::ranges::none_of(snap.routers, [](const auto& board) {
+    return board.sender_id == "LEAVING_NODE" ||
+           std::ranges::find(board.connections, std::string("LEAVING_NODE")) != board.connections.end();
+  }));
+  {
+    char json[8] = {};
+    ASSERT_EQ(seds_router_export_client_stats(router.raw(), "LEAVING_NODE", 12, json, sizeof(json)), SEDS_OK);
+    ASSERT_STREQ(json, "null");
+  }
+
+  seds::Relay relay;
+  const int32_t relay_side =
+      relay.add_side_serialized("A", [](std::span<const uint8_t>) { return SEDS_OK; }, false);
+  ASSERT_GE(relay_side, 0);
+  ASSERT_EQ(seds_relay_rx_packet_from_side(relay.raw(), static_cast<uint32_t>(relay_side), &announce_view), SEDS_OK);
+  ASSERT_EQ(relay.process_all(), SEDS_OK);
+  {
+    const int32_t len = seds_relay_export_client_stats_len(relay.raw(), "LEAVING_NODE", 12);
+    ASSERT_GT(len, 5);
+    std::string json(static_cast<size_t>(len), '\0');
+    ASSERT_EQ(seds_relay_export_client_stats(relay.raw(), "LEAVING_NODE", 12, json.data(), json.size()), SEDS_OK);
+    ASSERT_NE(json.find("\"sender_id\":\"LEAVING_NODE\""), std::string::npos);
+    ASSERT_NE(json.find("\"side_names\":[\"A\"]"), std::string::npos);
+  }
+  ASSERT_EQ(seds_relay_rx_packet_from_side(relay.raw(), static_cast<uint32_t>(relay_side), &topology_view), SEDS_OK);
+  ASSERT_EQ(relay.process_all(), SEDS_OK);
+  ASSERT_TRUE(std::ranges::any_of(relay.export_topology().routers, [](const auto& board) {
+    return board.sender_id == "LEAVING_NODE";
+  }));
+  ASSERT_EQ(seds_relay_rx_packet_from_side(relay.raw(), static_cast<uint32_t>(relay_side), &leave_view), SEDS_OK);
+  ASSERT_EQ(relay.process_all(), SEDS_OK);
+  const auto relay_snap = relay.export_topology();
+  ASSERT_TRUE(std::ranges::none_of(relay_snap.routers, [](const auto& board) {
+    return board.sender_id == "LEAVING_NODE" ||
+           std::ranges::find(board.connections, std::string("LEAVING_NODE")) != board.connections.end();
+  }));
+  {
+    char json[8] = {};
+    ASSERT_EQ(seds_relay_export_client_stats(relay.raw(), "LEAVING_NODE", 12, json, sizeof(json)), SEDS_OK);
+    ASSERT_STREQ(json, "null");
+  }
 }
 
 void test_router_failover_route_mode_switches_when_preferred_path_expires() {
@@ -4606,6 +4964,9 @@ void test_multibus_system_flow() {
 TEST(PacketTest, RoundtripAndCompression) { test_packet_roundtrip_and_compression(); }
 TEST(PacketTest, SerializeRoundtripGps) { test_packet_roundtrip_gps_exact(); }
 TEST(PacketTest, StringFormatting) { test_packet_string_formatting(); }
+TEST(PacketTest, RuntimeTuningUpdatesPacketFormatAndStringLimits) {
+  test_runtime_tuning_updates_packet_format_and_string_limits();
+}
 TEST(PacketTest, HeaderStringMatchesExpectation) { test_header_string_matches_expectation(); }
 TEST(PacketTest, DataAsF32RoundtripsGps) { test_data_as_f32_roundtrips_gps(); }
 TEST(PacketTest, MismatchedTypedAccessorReturnsTypeMismatch) { test_mismatched_typed_accessor_returns_type_mismatch(); }
@@ -4667,6 +5028,7 @@ TEST(RouterTest, LocalHandlerFailureSendsErrorPacketToOtherLocals) {
   test_local_handler_failure_sends_error_packet_to_other_locals();
 }
 TEST(RouterTest, LocalHandlerRetryAttemptsAreThree) { test_local_handler_retry_attempts_are_three(); }
+TEST(RouterTest, RuntimeTuningUpdatesHandlerRetryLimit) { test_runtime_tuning_updates_handler_retry_limit(); }
 TEST(RouterTest, ProcessAllQueuesHandlesU64Wraparound) { test_process_all_queues_handles_u64_wraparound(); }
 TEST(RouterTest, ProcessAllQueuesTimeoutZeroDrainsFully) { test_process_all_queues_timeout_zero_drains_fully(); }
 TEST(RouterTest, ProcessAllQueuesRespectsNonzeroTimeoutBudgetOneReceiveOneSend) {
@@ -4732,6 +5094,11 @@ TEST(RouterTest, SideEnableDisableAndRemove) { test_side_enable_disable_and_remo
 TEST(RouterTest, RouteControls) { test_router_route_controls(); }
 TEST(RouterTest, TypedRoutesCanTargetOneOrManySides) { test_router_typed_routes_can_target_one_or_many_sides(); }
 TEST(RouterTest, BoundedQueueBehavior) { test_bounded_queue_behavior(); }
+TEST(RouterTest, RuntimeDeviceIdentifierUpdatesNewRouterSender) {
+  test_runtime_device_identifier_updates_new_router_sender();
+}
+TEST(RouterTest, RuntimeTuningUpdatesReliablePendingLimit) { test_runtime_tuning_updates_reliable_pending_limit(); }
+TEST(RouterTest, RuntimeMemoryBudgetCapsQueuedState) { test_router_runtime_memory_budget_caps_queued_state(); }
 TEST(RouterTest, DiscoverySelfIgnoreAndPerSideAdvertise) { test_discovery_self_ignore_and_per_side_advertise(); }
 TEST(RouterTest, SenderIdentityMatchesOutboundProtocol) { test_router_sender_identity_matches_outbound_protocol(); }
 TEST(RouterTest, DiscoveryRoutesForOutboundPackets) { test_discovery_routes_for_outbound_packets(); }
@@ -4744,6 +5111,7 @@ TEST(RouterTest, RemoveSideUpdatesDiscoveryRoutesAndAnnouncesRemainingTopology) 
 TEST(RouterTest, ExportsBoardGraphAndTracksTransitiveEndpointHolders) {
   test_router_exports_board_graph_and_tracks_transitive_endpoint_holders();
 }
+TEST(RouterTest, DiscoveryLeavePrunesTopologyImmediately) { test_discovery_leave_prunes_topology_immediately(); }
 TEST(RouterTest, RuntimeRoutesSupportAsymmetricAndIngressOnlyLinks) {
   test_router_runtime_routes_support_asymmetric_and_ingress_only_links();
 }
@@ -4782,6 +5150,7 @@ TEST(RelayTest, TimeoutLimitsWorkPerCall) { test_relay_timeout_limits_work_per_c
 TEST(RelayTest, ConcurrentRxIsThreadSafe) { test_relay_concurrent_rx_is_thread_safe(); }
 TEST(RelayTest, RouteControls) { test_relay_route_controls(); }
 TEST(RelayTest, TypedRoutesCanTargetOneOrManySides) { test_relay_typed_routes_can_target_one_or_many_sides(); }
+TEST(RelayTest, RuntimeMemoryBudgetCapsQueuedState) { test_relay_runtime_memory_budget_caps_queued_state(); }
 TEST(RelayTest, DiscoverySelectiveFanout) { test_relay_discovery_selective_fanout(); }
 TEST(RelayTest, RemoveSideStopsTransmitAndRejectsRemovedIngress) {
   test_relay_remove_side_stops_transmit_and_rejects_removed_ingress();

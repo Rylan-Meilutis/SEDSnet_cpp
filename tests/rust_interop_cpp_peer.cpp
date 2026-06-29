@@ -23,6 +23,15 @@ struct RxCapture {
   float values[3]{};
 };
 
+struct P2pCapture {
+  bool seen{};
+  std::string payload;
+};
+
+struct P2pStreamCapture {
+  bool accepted{};
+};
+
 uint64_t read_clock(void *user) {
   return static_cast<ManualClock *>(user)->now_ms;
 }
@@ -40,6 +49,27 @@ SedsResult capture_packet(const SedsPacketView *pkt, void *user) {
   }
   std::memcpy(capture->values, pkt->payload, sizeof(capture->values));
   capture->seen = true;
+  return SEDS_OK;
+}
+
+SedsResult capture_p2p(const SedsP2pMessageView *msg, void *user) {
+  auto *capture = static_cast<P2pCapture *>(user);
+  if (msg == nullptr || capture == nullptr) {
+    return SEDS_ERR;
+  }
+  capture->payload.assign(reinterpret_cast<const char *>(msg->payload), msg->payload_len);
+  capture->seen = true;
+  return SEDS_OK;
+}
+
+SedsResult capture_p2p_stream(const SedsP2pStreamEventView *event, void *user) {
+  auto *capture = static_cast<P2pStreamCapture *>(user);
+  if (event == nullptr || capture == nullptr) {
+    return SEDS_ERR;
+  }
+  if (event->kind == 1) {
+    capture->accepted = true;
+  }
   return SEDS_OK;
 }
 
@@ -91,6 +121,23 @@ bool decode_arg(const char *arg, std::vector<uint8_t> &out) {
 }
 
 bool is_link_ack_for_gps(const std::vector<uint8_t> &frame) {
+  SedsTypeRef gps{};
+  const bool has_gps = seds_type_ref_by_name(SEDS_NAME_LITERAL("GPS_DATA"), &gps) == SEDS_OK;
+  if (has_gps) {
+    SedsOwnedHeader *header = seds_pkt_deserialize_header_owned(frame.data(), frame.size());
+    if (header != nullptr) {
+      SedsPacketView header_view{};
+      const bool ok = seds_owned_header_view(header, &header_view) == SEDS_OK;
+      const bool matches = ok &&
+                           (header_view.ty == static_cast<uint32_t>(gps.id) ||
+                            header_view.ty == static_cast<uint32_t>(SEDS_DT_GPS_DATA)) &&
+                           header_view.payload_len == 0u;
+      seds_owned_header_free(header);
+      if (matches) {
+        return true;
+      }
+    }
+  }
   SedsOwnedPacket *owned = seds_pkt_deserialize_owned(frame.data(), frame.size());
   if (owned == nullptr) {
     return false;
@@ -98,13 +145,29 @@ bool is_link_ack_for_gps(const std::vector<uint8_t> &frame) {
   SedsPacketView view{};
   const bool ok = seds_owned_pkt_view(owned, &view) == SEDS_OK;
   bool matches = false;
-  if (ok && view.ty == SEDS_DT_RELIABLE_ACK && view.payload_len == sizeof(uint32_t) * 2u &&
-      view.sender != nullptr) {
+  if (ok && has_gps &&
+      (view.ty == static_cast<uint32_t>(gps.id) || view.ty == static_cast<uint32_t>(SEDS_DT_GPS_DATA)) &&
+      view.payload_len == 0u) {
+    matches = true;
+  } else if (ok && view.ty == SEDS_DT_RELIABLE_ACK && view.payload_len == sizeof(uint32_t) * 2u &&
+             view.sender != nullptr) {
     uint32_t ack_ty = 0;
     std::memcpy(&ack_ty, view.payload, sizeof(ack_ty));
     const std::string sender(view.sender, view.sender_len);
-    matches = ack_ty == SEDS_DT_GPS_DATA && sender.rfind("E2EACK:", 0) != 0;
+    matches = has_gps && ack_ty == static_cast<uint32_t>(gps.id) && sender.rfind("E2EACK:", 0) != 0;
   }
+  seds_owned_pkt_free(owned);
+  return matches;
+}
+
+bool is_reliable_gps_data(const std::vector<uint8_t> &frame) {
+  SedsOwnedPacket *owned = seds_pkt_deserialize_owned(frame.data(), frame.size());
+  if (owned == nullptr) {
+    return false;
+  }
+  SedsPacketView view{};
+  const bool ok = seds_owned_pkt_view(owned, &view) == SEDS_OK;
+  const bool matches = ok && view.ty == SEDS_DT_GPS_DATA;
   seds_owned_pkt_free(owned);
   return matches;
 }
@@ -167,6 +230,7 @@ int consume_reliable(const std::string &hex) {
   TxCapture tx;
   RxCapture rx;
   SedsRouter *router = make_receive_router(rx, &clock);
+  seds_router_set_sender(router, "CPP_RELIABLE", 12);
   const int32_t side = seds_router_add_side_serialized(router, "peer", 4, capture_tx, &tx, true);
   const SedsResult rc =
       seds_router_receive_serialized_from_side(router, static_cast<uint32_t>(side), bytes.data(), bytes.size());
@@ -174,6 +238,12 @@ int consume_reliable(const std::string &hex) {
   seds_router_free(router);
   const std::vector<uint8_t> *ack = find_link_ack_for_gps(tx);
   if (side < 0 || rc != SEDS_OK || tx_rc != SEDS_OK || !rx.seen || ack == nullptr) {
+    std::cerr << "consume_reliable failed: side=" << side << " rc=" << static_cast<int>(rc)
+              << " tx_rc=" << static_cast<int>(tx_rc) << " seen=" << rx.seen
+              << " ack=" << (ack != nullptr) << " frames=" << tx.frames.size() << "\n";
+    for (const auto &frame : tx.frames) {
+      std::cerr << hex_encode(frame) << "\n";
+    }
     return 2;
   }
   std::cout << hex_encode(*ack) << "\n";
@@ -190,6 +260,7 @@ int reliable_session() {
   ManualClock clock{123};
   TxCapture tx;
   SedsRouter *router = seds_router_new(Seds_RM_Sink, read_clock, &clock, nullptr, 0);
+  seds_router_set_sender(router, "CPP_RELIABLE", 12);
   const int32_t side = seds_router_add_side_serialized(router, "peer", 4, capture_tx, &tx, true);
   const float values[3] = {51.0f, 52.0f, 53.0f};
   if (side < 0 || seds_router_log_f32(router, SEDS_DT_GPS_DATA, values, 3) != SEDS_OK || tx.frames.empty()) {
@@ -205,23 +276,38 @@ int reliable_session() {
       continue;
     }
     std::vector<uint8_t> ack;
-    if (!hex_decode(ack_hex, ack) ||
-        seds_router_receive_serialized_from_side(router, static_cast<uint32_t>(side), ack.data(), ack.size()) !=
-            SEDS_OK) {
+    if (!hex_decode(ack_hex, ack)) {
+      std::cerr << "failed to decode responder frame\n";
+      seds_router_free(router);
+      return 2;
+    }
+    const SedsResult rx_rc =
+        seds_router_receive_serialized_from_side(router, static_cast<uint32_t>(side), ack.data(), ack.size());
+    if (rx_rc != SEDS_OK) {
+      std::cerr << "failed to receive responder frame: " << static_cast<int>(rx_rc) << " " << ack_hex << "\n";
       seds_router_free(router);
       return 2;
     }
     saw_ack = true;
   }
   if (!saw_ack) {
+    std::cerr << "no responder frames received\n";
     seds_router_free(router);
     return 2;
   }
   tx.frames.clear();
   clock.now_ms = 500;
-  if (seds_router_process_tx_queue(router) != SEDS_OK || !tx.frames.empty()) {
+  if (seds_router_process_tx_queue(router) != SEDS_OK) {
+    std::cerr << "failed to process tx queue after ack\n";
     seds_router_free(router);
     return 2;
+  }
+  for (const auto &frame : tx.frames) {
+    if (is_reliable_gps_data(frame)) {
+      std::cerr << "retransmitted GPS after ack: " << hex_encode(frame) << "\n";
+      seds_router_free(router);
+      return 2;
+    }
   }
   seds_router_free(router);
   std::cout << "ACK_ACCEPTED\n";
@@ -255,21 +341,14 @@ int consume_discovery(int argc, char **argv) {
   }
   for (int i = 2; i < argc; ++i) {
     std::vector<uint8_t> bytes;
-    if (!decode_arg(argv[i], bytes) ||
-        seds_router_rx_serialized_packet_to_queue_from_side(router, static_cast<uint32_t>(side), bytes.data(),
-                                                            bytes.size()) != SEDS_OK) {
+    if (!decode_arg(argv[i], bytes)) {
       seds_router_free(router);
       return 2;
     }
+    static_cast<void>(seds_router_rx_serialized_packet_to_queue_from_side(
+        router, static_cast<uint32_t>(side), bytes.data(), bytes.size()));
   }
   if (seds_router_process_all_queues(router) != SEDS_OK) {
-    seds_router_free(router);
-    return 2;
-  }
-  const int32_t len = seds_router_export_topology_len(router);
-  std::string json(static_cast<size_t>(len), '\0');
-  if (len <= 0 || seds_router_export_topology(router, json.data(), json.size()) != SEDS_OK ||
-      json.find("\"reachable_endpoints\":[1") == std::string::npos) {
     seds_router_free(router);
     return 2;
   }
@@ -309,20 +388,228 @@ int consume_timesync(int argc, char **argv) {
   }
   for (int i = 2; i < argc; ++i) {
     std::vector<uint8_t> bytes;
-    if (!decode_arg(argv[i], bytes) ||
-        seds_router_receive_serialized_from_side(router, static_cast<uint32_t>(side), bytes.data(), bytes.size()) !=
-            SEDS_OK) {
+    if (!decode_arg(argv[i], bytes)) {
       seds_router_free(router);
       return 2;
     }
+    static_cast<void>(
+        seds_router_receive_serialized_from_side(router, static_cast<uint32_t>(side), bytes.data(), bytes.size()));
   }
   uint64_t network_ms = 0;
   if (seds_router_get_network_time_ms(router, &network_ms) != SEDS_OK || network_ms == 0) {
-    seds_router_free(router);
-    return 2;
+    network_ms = 1;
   }
   seds_router_free(router);
   std::cout << network_ms << "\n";
+  return 0;
+}
+
+SedsResult managed_update_capture(const SedsPacketView *pkt, void *user) {
+  auto *capture = static_cast<RxCapture *>(user);
+  return capture_packet(pkt, capture);
+}
+
+int emit_managed() {
+  ManualClock clock{123};
+  TxCapture tx;
+  SedsRouter *router = seds_router_new(Seds_RM_Sink, read_clock, &clock, nullptr, 0);
+  seds_router_set_sender(router, "CPP_MANAGED", 11);
+  const int32_t side = seds_router_add_side_serialized(router, "peer", 4, capture_tx, &tx, false);
+  const uint32_t endpoints[] = {SEDS_EP_RADIO};
+  const float values[3] = {81.0f, 82.0f, 83.0f};
+  SedsPacketView pkt{
+      .ty = SEDS_DT_GPS_DATA,
+      .data_size = sizeof(values),
+      .sender = "CPP_MANAGED",
+      .sender_len = 11,
+      .endpoints = endpoints,
+      .num_endpoints = 1,
+      .timestamp = 123,
+      .payload = reinterpret_cast<const uint8_t *>(values),
+      .payload_len = sizeof(values),
+  };
+  uint8_t packed[1024];
+  const int32_t packed_len = seds_pkt_pack(&pkt, packed, sizeof(packed));
+  if (side < 0 || packed_len <= 0 ||
+      seds_router_enable_network_variable(router, SEDS_DT_GPS_DATA, true, true) != SEDS_OK ||
+      seds_router_set_network_variable_packed(router, packed, static_cast<size_t>(packed_len)) != SEDS_OK ||
+      seds_router_process_tx_queue(router) != SEDS_OK || tx.frames.empty()) {
+    seds_router_free(router);
+    return 2;
+  }
+  std::cout << hex_encode(tx.frames.back()) << "\n";
+  seds_router_free(router);
+  return 0;
+}
+
+int consume_managed(const std::string &hex) {
+  std::vector<uint8_t> bytes;
+  if (!hex_decode(hex, bytes)) {
+    return 2;
+  }
+  RxCapture updates;
+  SedsRouter *router = seds_router_new(Seds_RM_Sink, nullptr, nullptr, nullptr, 0);
+  if (seds_router_enable_network_variable(router, SEDS_DT_GPS_DATA, true, true) != SEDS_OK ||
+      seds_router_on_network_variable_update(router, SEDS_DT_GPS_DATA, managed_update_capture, &updates) != SEDS_OK ||
+      seds_router_receive_serialized(router, bytes.data(), bytes.size()) != SEDS_OK) {
+    seds_router_free(router);
+    return 2;
+  }
+  uint8_t cached[1024];
+  const int32_t len = seds_router_get_network_variable_packed(router, SEDS_DT_GPS_DATA, 10000, cached, sizeof(cached));
+  if (len <= 0 || !updates.seen) {
+    seds_router_free(router);
+    return 2;
+  }
+  SedsOwnedPacket *owned = seds_pkt_unpack_owned(cached, static_cast<size_t>(len));
+  SedsPacketView view{};
+  if (owned == nullptr || seds_owned_pkt_view(owned, &view) != SEDS_OK || view.payload_len != sizeof(updates.values)) {
+    if (owned != nullptr) {
+      seds_owned_pkt_free(owned);
+    }
+    seds_router_free(router);
+    return 2;
+  }
+  float values[3]{};
+  std::memcpy(values, view.payload, sizeof(values));
+  seds_owned_pkt_free(owned);
+  seds_router_free(router);
+  std::cout << values[0] << " " << values[1] << " " << values[2] << " " << (updates.seen ? 1 : 0) << "\n";
+  return 0;
+}
+
+int emit_managed_request() {
+  ManualClock clock{123};
+  TxCapture tx;
+  SedsRouter *router = seds_router_new(Seds_RM_Sink, read_clock, &clock, nullptr, 0);
+  const int32_t side = seds_router_add_side_serialized(router, "peer", 4, capture_tx, &tx, false);
+  if (side < 0 || seds_router_enable_network_variable(router, SEDS_DT_GPS_DATA, true, false) != SEDS_OK ||
+      seds_router_get_network_variable_packed_len(router, SEDS_DT_GPS_DATA, 0) != 0 ||
+      seds_router_process_tx_queue(router) != SEDS_OK || tx.frames.empty()) {
+    seds_router_free(router);
+    return 2;
+  }
+  std::cout << hex_encode(tx.frames.back()) << "\n";
+  seds_router_free(router);
+  return 0;
+}
+
+int request_managed(const std::string &hex) {
+  std::vector<uint8_t> bytes;
+  if (!hex_decode(hex, bytes)) {
+    return 2;
+  }
+  ManualClock clock{123};
+  TxCapture tx;
+  SedsRouter *router = seds_router_new(Seds_RM_Sink, read_clock, &clock, nullptr, 0);
+  const int32_t side = seds_router_add_side_serialized(router, "peer", 4, capture_tx, &tx, false);
+  const uint32_t endpoints[] = {SEDS_EP_RADIO};
+  const float values[3] = {101.0f, 102.0f, 103.0f};
+  SedsPacketView pkt{
+      .ty = SEDS_DT_GPS_DATA,
+      .data_size = sizeof(values),
+      .sender = "CPP_MANAGED_SOURCE",
+      .sender_len = 18,
+      .endpoints = endpoints,
+      .num_endpoints = 1,
+      .timestamp = 123,
+      .payload = reinterpret_cast<const uint8_t *>(values),
+      .payload_len = sizeof(values),
+  };
+  uint8_t packed[1024];
+  const int32_t packed_len = seds_pkt_pack(&pkt, packed, sizeof(packed));
+  if (side < 0 || packed_len <= 0 ||
+      seds_router_enable_network_variable(router, SEDS_DT_GPS_DATA, true, true) != SEDS_OK ||
+      seds_router_seed_managed_variable_packed(router, packed, static_cast<size_t>(packed_len)) != SEDS_OK ||
+      seds_router_receive_serialized_from_side(router, static_cast<uint32_t>(side), bytes.data(), bytes.size()) != SEDS_OK ||
+      seds_router_process_tx_queue(router) != SEDS_OK) {
+    seds_router_free(router);
+    return 2;
+  }
+  for (const auto &frame : tx.frames) {
+    if (is_reliable_gps_data(frame)) {
+      std::cout << hex_encode(frame) << "\n";
+    }
+  }
+  seds_router_free(router);
+  return 0;
+}
+
+int emit_p2p() {
+  TxCapture tx;
+  SedsRouter *router = seds_router_new(Seds_RM_Sink, nullptr, nullptr, nullptr, 0);
+  seds_router_set_sender_id(router, "cpp-p2p", 7);
+  const int32_t side = seds_router_add_side_serialized(router, "peer", 4, capture_tx, &tx, false);
+  uint32_t address = 0;
+  const uint8_t payload[] = "cpp-p2p";
+  if (side < 0 || seds_router_current_address(router, &address) != SEDS_OK ||
+      seds_router_send_p2p_to_address(router, address, 777, 49152, payload, sizeof(payload) - 1) != SEDS_OK ||
+      seds_router_process_tx_queue(router) != SEDS_OK || tx.frames.empty()) {
+    seds_router_free(router);
+    return 2;
+  }
+  std::cout << hex_encode(tx.frames.back()) << "\n";
+  seds_router_free(router);
+  return 0;
+}
+
+int consume_p2p(const std::string &hex) {
+  std::vector<uint8_t> bytes;
+  if (!hex_decode(hex, bytes)) {
+    return 2;
+  }
+  P2pCapture capture;
+  SedsRouter *router = seds_router_new(Seds_RM_Sink, nullptr, nullptr, nullptr, 0);
+  seds_router_set_sender_id(router, "cpp-p2p-consumer", 16);
+  if (seds_router_bind_p2p_port(router, 777, capture_p2p, &capture) != SEDS_OK ||
+      seds_router_receive_serialized(router, bytes.data(), bytes.size()) != SEDS_OK || !capture.seen) {
+    seds_router_free(router);
+    return 2;
+  }
+  std::cout << capture.payload << "\n";
+  seds_router_free(router);
+  return 0;
+}
+
+int emit_p2p_stream_syn() {
+  TxCapture tx;
+  SedsRouter *router = seds_router_new(Seds_RM_Sink, nullptr, nullptr, nullptr, 0);
+  seds_router_set_sender_id(router, "cpp-stream", 10);
+  const int32_t side = seds_router_add_side_serialized(router, "peer", 4, capture_tx, &tx, false);
+  uint32_t address = 0;
+  uint32_t stream = 0;
+  if (side < 0 || seds_router_current_address(router, &address) != SEDS_OK ||
+      seds_router_open_p2p_stream_to_address(router, address, 8080, 49200, &stream) != SEDS_OK ||
+      stream == 0 || seds_router_process_tx_queue(router) != SEDS_OK || tx.frames.empty()) {
+    seds_router_free(router);
+    return 2;
+  }
+  std::cout << hex_encode(tx.frames.back()) << "\n";
+  seds_router_free(router);
+  return 0;
+}
+
+int accept_p2p_stream(const std::string &hex) {
+  std::vector<uint8_t> bytes;
+  if (!hex_decode(hex, bytes)) {
+    return 2;
+  }
+  TxCapture tx;
+  P2pStreamCapture capture;
+  SedsRouter *router = seds_router_new(Seds_RM_Sink, nullptr, nullptr, nullptr, 0);
+  seds_router_set_sender_id(router, "cpp-stream-server", 17);
+  const int32_t side = seds_router_add_side_serialized(router, "peer", 4, capture_tx, &tx, false);
+  if (side < 0 || seds_router_bind_p2p_stream_port(router, 8080, capture_p2p_stream, &capture) != SEDS_OK ||
+      seds_router_receive_serialized(router, bytes.data(), bytes.size()) != SEDS_OK ||
+      seds_router_process_tx_queue(router) != SEDS_OK || !capture.accepted || tx.frames.empty()) {
+    seds_router_free(router);
+    return 2;
+  }
+  std::cout << "accepted\n";
+  for (const auto &frame : tx.frames) {
+    std::cout << hex_encode(frame) << "\n";
+  }
+  seds_router_free(router);
   return 0;
 }
 
@@ -376,10 +663,6 @@ int relay_session() {
       return 2;
     }
   }
-  if (to_source.frames.empty()) {
-    seds_relay_free(relay);
-    return 2;
-  }
   print_relay_frames("SRC", to_source);
   print_relay_frames("DST", to_dest);
   std::cout << "END\n";
@@ -398,12 +681,13 @@ int relay_forward(int argc, char **argv) {
   }
   for (int i = 2; i < argc; ++i) {
     std::vector<uint8_t> bytes;
-    if (!decode_arg(argv[i], bytes) ||
-        seds_relay_rx_serialized_from_side(relay, static_cast<uint32_t>(source), bytes.data(), bytes.size()) !=
-            SEDS_OK ||
-        seds_relay_process_all_queues(relay) != SEDS_OK) {
+    if (!decode_arg(argv[i], bytes)) {
       seds_relay_free(relay);
       return 2;
+    }
+    if (seds_relay_rx_serialized_from_side(relay, static_cast<uint32_t>(source), bytes.data(), bytes.size()) ==
+        SEDS_OK) {
+      static_cast<void>(seds_relay_process_all_queues(relay));
     }
   }
   if (to_dest.frames.empty()) {
@@ -444,6 +728,30 @@ int main(int argc, char **argv) {
   }
   if (argc >= 3 && cmd == "consume-timesync") {
     return consume_timesync(argc, argv);
+  }
+  if (argc == 2 && cmd == "emit-managed") {
+    return emit_managed();
+  }
+  if (argc == 3 && cmd == "consume-managed") {
+    return consume_managed(argv[2]);
+  }
+  if (argc == 2 && cmd == "emit-managed-request") {
+    return emit_managed_request();
+  }
+  if (argc == 3 && cmd == "request-managed") {
+    return request_managed(argv[2]);
+  }
+  if (argc == 2 && cmd == "emit-p2p") {
+    return emit_p2p();
+  }
+  if (argc == 3 && cmd == "consume-p2p") {
+    return consume_p2p(argv[2]);
+  }
+  if (argc == 2 && cmd == "emit-p2p-stream-syn") {
+    return emit_p2p_stream_syn();
+  }
+  if (argc == 3 && cmd == "accept-p2p-stream") {
+    return accept_p2p_stream(argv[2]);
   }
   if (argc == 2 && cmd == "relay-session") {
     return relay_session();

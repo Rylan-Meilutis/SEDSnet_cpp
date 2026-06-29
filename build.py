@@ -13,7 +13,7 @@ from pathlib import Path
 
 USAGE = """Usage:
   build.py [configure] [test] [release] [clean] [target=<cmake-target>] [jobs=<n>]
-           [build_dir=<dir>] [schema_path=<path>] [ipc_schema_path=<path>]
+           [build_dir=<dir>] [static_schema_path=<path>] [static_ipc_schema_path=<path>]
            [timesync=0|1] [discovery=0|1] [ctest_filter=<regex>]
 
 Examples:
@@ -21,7 +21,7 @@ Examples:
   build.py test
   build.py release test
   build.py test ctest_filter=sedsprintf_rust_router_interop
-  build.py configure build_dir=build/overlay ipc_schema_path=tests/schemas/ipc_link_local_overlay.json
+  build.py configure build_dir=build/overlay static_ipc_schema_path=tests/schemas/ipc_link_local_overlay.json
   build.py target=sedsprintf_cpp_overlay_tests
 """
 
@@ -69,10 +69,11 @@ def configure_args(root: Path, build_dir: Path, options: dict[str, object], *, e
     ]
     if export_compile_commands:
         cmake_args.append("-DCMAKE_EXPORT_COMPILE_COMMANDS=ON")
-    if options["schema_path"]:
-        cmake_args.append(f"-DSEDSPRINTF_SCHEMA_PATH={(root / str(options['schema_path'])).resolve()}")
-    if options["ipc_schema_path"]:
-        cmake_args.append(f"-DSEDSPRINTF_IPC_SCHEMA_PATH={(root / str(options['ipc_schema_path'])).resolve()}")
+    cmake_args.append(f"-DSEDSNET_ENABLE_TESTS={'ON' if options['test'] else 'OFF'}")
+    if options["static_schema_path"]:
+        cmake_args.append(f"-DSEDSNET_SCHEMA_PATH={(root / str(options['static_schema_path'])).resolve()}")
+    if options["static_ipc_schema_path"]:
+        cmake_args.append(f"-DSEDSNET_IPC_SCHEMA_PATH={(root / str(options['static_ipc_schema_path'])).resolve()}")
     if options["timesync"] is not None:
         cmake_args.append(f"-DSEDSPRINTF_ENABLE_TIMESYNC={'ON' if options['timesync'] == '1' else 'OFF'}")
     if options["discovery"] is not None:
@@ -128,8 +129,8 @@ def parse_args(argv: list[str]) -> dict[str, object]:
         "clean": False,
         "configure_only": False,
         "build_dir": None,
-        "schema_path": None,
-        "ipc_schema_path": None,
+        "static_schema_path": None,
+        "static_ipc_schema_path": None,
         "timesync": None,
         "discovery": None,
         "target": None,
@@ -150,10 +151,14 @@ def parse_args(argv: list[str]) -> dict[str, object]:
             options["configure_only"] = True
         elif arg.startswith("build_dir="):
             options["build_dir"] = arg.split("=", 1)[1]
+        elif arg.startswith("static_schema_path="):
+            options["static_schema_path"] = arg.split("=", 1)[1]
+        elif arg.startswith("static_ipc_schema_path="):
+            options["static_ipc_schema_path"] = arg.split("=", 1)[1]
         elif arg.startswith("schema_path="):
-            options["schema_path"] = arg.split("=", 1)[1]
+            options["static_schema_path"] = arg.split("=", 1)[1]
         elif arg.startswith("ipc_schema_path="):
-            options["ipc_schema_path"] = arg.split("=", 1)[1]
+            options["static_ipc_schema_path"] = arg.split("=", 1)[1]
         elif arg.startswith("timesync="):
             value = arg.split("=", 1)[1]
             if value not in {"0", "1"}:

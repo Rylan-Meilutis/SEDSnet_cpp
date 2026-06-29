@@ -2,9 +2,63 @@
 
 namespace
 {
+  std::map<uint32_t, std::string> g_handler_placeholder_endpoint_names;
+
   seds::RoutePolicy & policy_for(SedsRouter & r, int32_t src_side_id)
   {
     return src_side_id < 0 ? r.local_policy : r.source_policy[src_side_id];
+  }
+
+  void ensure_handler_endpoint(uint32_t endpoint)
+  {
+    if (seds::valid_endpoint(endpoint))
+    {
+      return;
+    }
+    if (endpoint >= seds::kEndpointNames.size())
+    {
+      seds::kEndpointNames.resize(endpoint + 1u, nullptr);
+    }
+    auto & name = g_handler_placeholder_endpoint_names[endpoint];
+    name = "ENDPOINT_" + std::to_string(endpoint);
+    seds::kEndpointNames[endpoint] = name.c_str();
+    seds::kEndpointCount = static_cast<uint32_t>(seds::kEndpointNames.size());
+  }
+
+  bool valid_router_e2e_mode(uint8_t mode)
+  {
+    return mode == SEDS_ROUTER_E2E_DISABLED || mode == SEDS_ROUTER_E2E_REQUIRED_ONLY ||
+           mode == SEDS_ROUTER_E2E_PREFERRED || mode == SEDS_ROUTER_E2E_FORCE_ALL;
+  }
+
+  SedsRouter * new_router_impl(SedsRouterMode mode, SedsNowMsFn now_ms_cb, void * user,
+                               const SedsLocalEndpointDesc * handlers, size_t n_handlers,
+                               uint8_t e2e_mode, const SedsRuntimeMemoryConfig * memory)
+  {
+    if ((handlers == nullptr && n_handlers != 0) || !valid_router_e2e_mode(e2e_mode))
+    {
+      return nullptr;
+    }
+    const SedsRuntimeMemoryConfig cfg = memory == nullptr ? seds::default_runtime_memory_config() : *memory;
+    if (!seds::validate_runtime_memory_config(cfg))
+    {
+      return nullptr;
+    }
+    auto router = std::make_unique<SedsRouter>(mode);
+    router->memory = cfg;
+    router->now_ms_cb = now_ms_cb;
+    router->clock_user = user;
+    for (size_t i = 0; i < n_handlers; ++i)
+    {
+      if (handlers[i].endpoint == SEDS_EP_DISCOVERY || handlers[i].endpoint == SEDS_EP_TIME_SYNC)
+      {
+        return nullptr;
+      }
+      ensure_handler_endpoint(handlers[i].endpoint);
+      router->locals.push_back(
+        {handlers[i].endpoint, handlers[i].packet_handler, handlers[i].serialized_handler, handlers[i].user});
+    }
+    return router.release();
   }
 
   bool timeout_expired(uint64_t start_ms, uint64_t now_ms, uint32_t timeout_ms)
@@ -145,19 +199,16 @@ extern "C" {
 SedsRouter * seds_router_new(SedsRouterMode mode, SedsNowMsFn now_ms_cb, void * user,
                              const SedsLocalEndpointDesc * handlers, size_t n_handlers)
 {
-  auto router = std::make_unique<SedsRouter>(mode);
-  router->now_ms_cb = now_ms_cb;
-  router->clock_user = user;
-  for (size_t i = 0; i < n_handlers; ++i)
-  {
-    if (handlers[i].endpoint == SEDS_EP_DISCOVERY || handlers[i].endpoint == SEDS_EP_TIME_SYNC)
-    {
-      return nullptr;
-    }
-    router->locals.push_back(
-      {handlers[i].endpoint, handlers[i].packet_handler, handlers[i].serialized_handler, handlers[i].user});
-  }
-  return router.release();
+  return new_router_impl(mode, now_ms_cb, user, handlers, n_handlers, SEDS_ROUTER_E2E_PREFERRED, nullptr);
+}
+
+SedsRouter * seds_router_new_with_memory(SedsRouterMode mode, SedsNowMsFn now_ms_cb, void * user,
+                                         const SedsLocalEndpointDesc * handlers, size_t n_handlers,
+                                         uint8_t e2e_mode, uint32_t e2e_key_id,
+                                         const SedsRuntimeMemoryConfig * memory)
+{
+  (void)e2e_key_id;
+  return new_router_impl(mode, now_ms_cb, user, handlers, n_handlers, e2e_mode, memory);
 }
 
 void seds_router_free(SedsRouter * r) { delete r; }
@@ -289,7 +340,7 @@ SedsResult seds_router_poll_timesync(SedsRouter * r, bool * out_did_queue)
     auto pkt = seds::make_internal_packet(SEDS_DT_TIME_SYNC_ANNOUNCE, now, std::move(payload));
     pkt.sender = r->sender;
     seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes,
-                           {std::move(pkt), std::nullopt, std::nullopt, false});
+                           {std::move(pkt), std::nullopt, std::nullopt, false}, r->memory.max_queue_budget);
     r->timesync.last_announce_ms = now;
     if (out_did_queue)
       *out_did_queue = true;
@@ -317,7 +368,7 @@ SedsResult seds_router_poll_timesync(SedsRouter * r, bool * out_did_queue)
     auto pkt = seds::make_internal_packet(SEDS_DT_TIME_SYNC_REQUEST, now, std::move(payload));
     pkt.sender = r->sender;
     seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes,
-                           {std::move(pkt), std::nullopt, std::nullopt, false});
+                           {std::move(pkt), std::nullopt, std::nullopt, false}, r->memory.max_queue_budget);
     r->timesync.last_request_ms = now;
     if (out_did_queue)
       *out_did_queue = true;
@@ -694,13 +745,18 @@ SedsResult seds_router_log_bytes_ex(SedsRouter * r, SedsDataType ty, const uint8
   std::scoped_lock lock(r->mu);
   if (queue)
   {
-    if (!seds::enqueue_tx(r->tx_queue, r->tx_queue_bytes, {std::move(pkt), std::nullopt, std::nullopt, true}))
+    if (!seds::enqueue_tx(r->tx_queue, r->tx_queue_bytes, {std::move(pkt), std::nullopt, std::nullopt, true},
+                          r->memory.max_queue_budget))
+    {
       return SEDS_PACKET_TOO_LARGE;
+    }
+    seds::enforce_shared_queue_budget(*r);
   }
   else
   {
     seds::dispatch_local_from_packet(pkt, r->locals);
-    if (!seds::enqueue_tx(r->tx_queue, r->tx_queue_bytes, {std::move(pkt), std::nullopt, std::nullopt, false}))
+    if (!seds::enqueue_tx(r->tx_queue, r->tx_queue_bytes, {std::move(pkt), std::nullopt, std::nullopt, false},
+                          r->memory.max_queue_budget))
       return SEDS_PACKET_TOO_LARGE;
     while (auto item = seds::pop_tx(r->tx_queue, r->tx_queue_bytes))
     {
@@ -710,7 +766,7 @@ SedsResult seds_router_log_bytes_ex(SedsRouter * r, SedsDataType ty, const uint8
         if (rc == SEDS_IO && r->side_tx_deferred)
         {
           r->side_tx_deferred = false;
-          seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item));
+          seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item), r->memory.max_queue_budget);
           return SEDS_OK;
         }
         return rc;
@@ -811,13 +867,22 @@ SedsResult seds_router_transmit_message_queue(SedsRouter * r, const SedsPacketVi
   std::scoped_lock lock(r->mu);
   if (all_endpoints_local(*r, pkt))
   {
-    return seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, {std::move(pkt), std::nullopt, {}})
-             ? SEDS_OK
-             : SEDS_PACKET_TOO_LARGE;
+    const bool enqueued = seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, {std::move(pkt), std::nullopt, {}},
+                                           r->memory.max_queue_budget);
+    if (enqueued)
+    {
+      seds::enforce_shared_queue_budget(*r);
+    }
+    return enqueued ? SEDS_OK : SEDS_PACKET_TOO_LARGE;
   }
-  return seds::enqueue_tx(r->tx_queue, r->tx_queue_bytes, {std::move(pkt), std::nullopt, std::nullopt, true})
-           ? SEDS_OK
-           : SEDS_PACKET_TOO_LARGE;
+  const bool enqueued = seds::enqueue_tx(r->tx_queue, r->tx_queue_bytes,
+                                         {std::move(pkt), std::nullopt, std::nullopt, true},
+                                         r->memory.max_queue_budget);
+  if (enqueued)
+  {
+    seds::enforce_shared_queue_budget(*r);
+  }
+  return enqueued ? SEDS_OK : SEDS_PACKET_TOO_LARGE;
 }
 
 SedsResult seds_router_transmit_serialized_message_queue(SedsRouter * r, const uint8_t * bytes, size_t len)
@@ -826,7 +891,8 @@ SedsResult seds_router_transmit_serialized_message_queue(SedsRouter * r, const u
   if (r == nullptr || !pkt)
     return SEDS_DESERIALIZE;
   std::scoped_lock lock(r->mu);
-  return seds::enqueue_tx(r->tx_queue, r->tx_queue_bytes, {*pkt, std::nullopt, std::nullopt, true})
+  return seds::enqueue_tx(r->tx_queue, r->tx_queue_bytes, {*pkt, std::nullopt, std::nullopt, true},
+                          r->memory.max_queue_budget)
            ? SEDS_OK
            : SEDS_PACKET_TOO_LARGE;
 }
@@ -854,7 +920,7 @@ SedsResult seds_router_process_tx_queue_with_timeout(SedsRouter * r, uint32_t)
     {
       if (rc == SEDS_IO)
       {
-        seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item));
+        seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item), r->memory.max_queue_budget);
         return SEDS_OK;
       }
       return rc;
@@ -926,7 +992,7 @@ SedsResult seds_router_process_all_queues_with_timeout(SedsRouter * r, uint32_t 
         {
           if (rc == SEDS_IO)
           {
-            seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item));
+            seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item), r->memory.max_queue_budget);
             return SEDS_OK;
           }
           return rc;
@@ -954,7 +1020,7 @@ SedsResult seds_router_process_all_queues_with_timeout(SedsRouter * r, uint32_t 
     {
       if (rc == SEDS_IO)
       {
-        seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item));
+        seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item), r->memory.max_queue_budget);
         break;
       }
       return rc;
@@ -1031,6 +1097,17 @@ SedsResult seds_router_receive_serialized_from_side(SedsRouter * r, uint32_t sid
     return SEDS_INVALID_LINK_ID;
   if (!r->sides[side_id].ingress_enabled)
     return SEDS_INVALID_LINK_ID;
+  if (frame->ack_only())
+  {
+    seds::PacketData ack_pkt;
+    ack_pkt.ty = frame->envelope.ty;
+    ack_pkt.sender = frame->envelope.sender;
+    ack_pkt.endpoints = frame->envelope.endpoints;
+    ack_pkt.timestamp = frame->envelope.timestamp_ms;
+    static_cast<void>(seds::process_reliable_ingress(*r, static_cast<int32_t>(side_id), *frame, ack_pkt,
+                                                     std::span<const uint8_t>(bytes, len)));
+    return SEDS_OK;
+  }
   const auto pkt = seds::deserialize_packet(bytes, len);
   if (!pkt)
     return SEDS_DESERIALIZE;
@@ -1050,7 +1127,7 @@ SedsResult seds_router_receive_serialized_from_side(SedsRouter * r, uint32_t sid
   seds::router_receive_impl(*r, *pkt, static_cast<int32_t>(side_id));
   for (auto & released: r->reliable_released_rx)
   {
-    seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, std::move(released));
+    seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, std::move(released), r->memory.max_queue_budget);
   }
   r->reliable_released_rx.clear();
   return seds_router_process_rx_queue(r);
@@ -1077,7 +1154,8 @@ SedsResult seds_router_rx_serialized_packet_to_queue(SedsRouter * r, const uint8
     return SEDS_DESERIALIZE;
   std::scoped_lock lock(r->mu);
   return seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes,
-                          {std::move(*pkt), std::nullopt, std::vector<uint8_t>(bytes, bytes + len)})
+                          {std::move(*pkt), std::nullopt, std::vector<uint8_t>(bytes, bytes + len)},
+                          r->memory.max_queue_budget)
            ? SEDS_OK
            : SEDS_PACKET_TOO_LARGE;
 }
@@ -1088,9 +1166,13 @@ SedsResult seds_router_rx_packet_to_queue(SedsRouter * r, const SedsPacketView *
   if (r == nullptr || !seds::packet_from_view(view, pkt))
     return SEDS_BAD_ARG;
   std::scoped_lock lock(r->mu);
-  return seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, {std::move(pkt), std::nullopt, {}})
-           ? SEDS_OK
-           : SEDS_PACKET_TOO_LARGE;
+  const bool enqueued = seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, {std::move(pkt), std::nullopt, {}},
+                                         r->memory.max_queue_budget);
+  if (enqueued)
+  {
+    seds::enforce_shared_queue_budget(*r);
+  }
+  return enqueued ? SEDS_OK : SEDS_PACKET_TOO_LARGE;
 }
 
 SedsResult seds_router_rx_serialized_packet_to_queue_from_side(SedsRouter * r, uint32_t side_id, const uint8_t * bytes,
@@ -1104,6 +1186,17 @@ SedsResult seds_router_rx_serialized_packet_to_queue_from_side(SedsRouter * r, u
     return SEDS_INVALID_LINK_ID;
   if (!r->sides[side_id].ingress_enabled)
     return SEDS_INVALID_LINK_ID;
+  if (frame->ack_only())
+  {
+    seds::PacketData ack_pkt;
+    ack_pkt.ty = frame->envelope.ty;
+    ack_pkt.sender = frame->envelope.sender;
+    ack_pkt.endpoints = frame->envelope.endpoints;
+    ack_pkt.timestamp = frame->envelope.timestamp_ms;
+    static_cast<void>(seds::process_reliable_ingress(*r, static_cast<int32_t>(side_id), *frame, ack_pkt,
+                                                     std::span<const uint8_t>(bytes, len)));
+    return SEDS_OK;
+  }
   const auto pkt = seds::deserialize_packet(bytes, len);
   if (!pkt)
     return SEDS_DESERIALIZE;
@@ -1115,15 +1208,16 @@ SedsResult seds_router_rx_serialized_packet_to_queue_from_side(SedsRouter * r, u
   const bool has_released = !r->reliable_released_rx.empty();
   const seds::RxItem current{*pkt, static_cast<int32_t>(side_id), std::vector<uint8_t>(bytes, bytes + len)};
   const bool enqueued = has_released
-                          ? seds::enqueue_rx_front(r->rx_queue, r->rx_queue_bytes, current)
-                          : seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, current);
+                          ? seds::enqueue_rx_front(r->rx_queue, r->rx_queue_bytes, current,
+                                                   r->memory.max_queue_budget)
+                          : seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, current, r->memory.max_queue_budget);
   if (!enqueued)
   {
     return SEDS_PACKET_TOO_LARGE;
   }
   for (auto & released: r->reliable_released_rx)
   {
-    seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, std::move(released));
+    seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, std::move(released), r->memory.max_queue_budget);
   }
   r->reliable_released_rx.clear();
   return SEDS_OK;
@@ -1139,8 +1233,13 @@ SedsResult seds_router_rx_packet_to_queue_from_side(SedsRouter * r, uint32_t sid
     return SEDS_INVALID_LINK_ID;
   if (!r->sides[side_id].ingress_enabled)
     return SEDS_INVALID_LINK_ID;
-  return seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, {std::move(pkt), static_cast<int32_t>(side_id), {}})
-           ? SEDS_OK
-           : SEDS_PACKET_TOO_LARGE;
+  const bool enqueued = seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes,
+                                         {std::move(pkt), static_cast<int32_t>(side_id), {}},
+                                         r->memory.max_queue_budget);
+  if (enqueued)
+  {
+    seds::enforce_shared_queue_budget(*r);
+  }
+  return enqueued ? SEDS_OK : SEDS_PACKET_TOO_LARGE;
 }
 } // extern "C"

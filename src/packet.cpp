@@ -32,6 +32,11 @@ std::optional<Packet> Packet::deserialize(std::span<const uint8_t> bytes) {
 }
 
 Packet Packet::from_f32_slice(uint32_t ty, std::span<const float> values, std::vector<uint32_t> endpoints,
+                              uint64_t timestamp) {
+    return from_f32_slice(ty, values, std::move(endpoints), timestamp, runtime_device_identifier());
+}
+
+Packet Packet::from_f32_slice(uint32_t ty, std::span<const float> values, std::vector<uint32_t> endpoints,
                               uint64_t timestamp, std::string sender) {
     std::vector<uint8_t> payload(values.size() * sizeof(float));
     std::memcpy(payload.data(), values.data(), payload.size());

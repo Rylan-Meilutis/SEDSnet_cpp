@@ -38,7 +38,16 @@ void erase_rx_items_for_side_locked(SedsRelay& r, int32_t side_id) {
 extern "C" {
 
 SedsRelay* seds_relay_new(SedsNowMsFn now_ms_cb, void* user) {
+    return seds_relay_new_with_memory(now_ms_cb, user, nullptr);
+}
+
+SedsRelay* seds_relay_new_with_memory(SedsNowMsFn now_ms_cb, void* user, const SedsRuntimeMemoryConfig* memory) {
+    const SedsRuntimeMemoryConfig cfg = memory == nullptr ? seds::default_runtime_memory_config() : *memory;
+    if (!seds::validate_runtime_memory_config(cfg)) {
+        return nullptr;
+    }
     auto relay = std::make_unique<SedsRelay>();
+    relay->memory = cfg;
     relay->now_ms_cb = now_ms_cb;
     relay->clock_user = user;
     return relay.release();
@@ -227,6 +236,16 @@ SedsResult seds_relay_rx_serialized_from_side(SedsRelay* r, uint32_t side_id, co
     std::scoped_lock lock(r->mu);
     if (static_cast<size_t>(side_id) >= r->sides.size()) return SEDS_INVALID_LINK_ID;
     if (!r->sides[side_id].ingress_enabled) return SEDS_INVALID_LINK_ID;
+    if (frame->ack_only()) {
+        seds::PacketData ack_pkt;
+        ack_pkt.ty = frame->envelope.ty;
+        ack_pkt.sender = frame->envelope.sender;
+        ack_pkt.endpoints = frame->envelope.endpoints;
+        ack_pkt.timestamp = frame->envelope.timestamp_ms;
+        static_cast<void>(seds::process_reliable_ingress(*r, static_cast<int32_t>(side_id), *frame, ack_pkt,
+                                                         std::span<const uint8_t>(bytes, len)));
+        return SEDS_OK;
+    }
     if (!frame->reliable.has_value()) {
         if (const auto id = seds::packet_id_from_wire(bytes, len); id.has_value()) {
         const uint64_t dedupe_id = *id ^ (static_cast<uint64_t>(side_id) << 56u);
@@ -242,11 +261,12 @@ SedsResult seds_relay_rx_serialized_from_side(SedsRelay* r, uint32_t side_id, co
                                         std::span<const uint8_t>(bytes, len))) {
         return SEDS_OK;
     }
-    if (!seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, {*pkt, static_cast<int32_t>(side_id), {}})) {
+    if (!seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, {*pkt, static_cast<int32_t>(side_id), {}},
+                          r->memory.max_queue_budget)) {
         return SEDS_PACKET_TOO_LARGE;
     }
     for (auto& released : r->reliable_released_rx) {
-        seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, std::move(released));
+        seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, std::move(released), r->memory.max_queue_budget);
     }
     r->reliable_released_rx.clear();
     return SEDS_OK;
@@ -258,9 +278,13 @@ SedsResult seds_relay_rx_packet_from_side(SedsRelay* r, uint32_t side_id, const 
     std::scoped_lock lock(r->mu);
     if (static_cast<size_t>(side_id) >= r->sides.size()) return SEDS_INVALID_LINK_ID;
     if (!r->sides[side_id].ingress_enabled) return SEDS_INVALID_LINK_ID;
-    return seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes, {std::move(pkt), static_cast<int32_t>(side_id), {}})
-               ? SEDS_OK
-               : SEDS_PACKET_TOO_LARGE;
+    const bool enqueued = seds::enqueue_rx(r->rx_queue, r->rx_queue_bytes,
+                                           {std::move(pkt), static_cast<int32_t>(side_id), {}},
+                                           r->memory.max_queue_budget);
+    if (enqueued) {
+        seds::enforce_shared_queue_budget(*r);
+    }
+    return enqueued ? SEDS_OK : SEDS_PACKET_TOO_LARGE;
 }
 
 SedsResult seds_relay_process_rx_queue(SedsRelay* r) { return seds_relay_process_rx_queue_with_timeout(r, 0); }
@@ -292,7 +316,7 @@ SedsResult seds_relay_process_tx_queue_with_timeout(SedsRelay* r, uint32_t) {
         const auto rc = seds::transmit_item(*r, *item);
         if (rc != SEDS_OK) {
             if (rc == SEDS_IO) {
-                seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item));
+                seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item), r->memory.max_queue_budget);
                 return SEDS_OK;
             }
             return rc;
@@ -318,7 +342,8 @@ SedsResult seds_relay_process_all_queues_with_timeout(SedsRelay* r, uint32_t tim
                 const auto rc = seds::transmit_item(*r, *item);
                 if (rc != SEDS_OK) {
                     if (rc == SEDS_IO) {
-                        seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item));
+                        seds::enqueue_tx_front(r->tx_queue, r->tx_queue_bytes, std::move(*item),
+                                               r->memory.max_queue_budget);
                         return SEDS_OK;
                     }
                     return rc;

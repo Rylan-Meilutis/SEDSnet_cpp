@@ -25,13 +25,14 @@ DEFAULT_SRESULT = [
     ("SEDS_MISSING_PAYLOAD", -8),
     ("SEDS_HANDLER_ERROR", -9),
     ("SEDS_BAD_ARG", -10),
-    ("SEDS_SERIALIZE", -11),
-    ("SEDS_DESERIALIZE", -12),
-    ("SEDS_IO", -13),
-    ("SEDS_INVALID_UTF8", -14),
-    ("SEDS_TYPE_MISMATCH", -15),
-    ("SEDS_INVALID_LINK_ID", -16),
-    ("SEDS_PACKET_TOO_LARGE", -17),
+    ("SEDS_PERMISSION_DENIED", -11),
+    ("SEDS_SERIALIZE", -12),
+    ("SEDS_DESERIALIZE", -13),
+    ("SEDS_IO", -14),
+    ("SEDS_INVALID_UTF8", -15),
+    ("SEDS_TYPE_MISMATCH", -16),
+    ("SEDS_INVALID_LINK_ID", -17),
+    ("SEDS_PACKET_TOO_LARGE", -18),
 ]
 
 TIMESYNC_ENDPOINT = {
@@ -153,9 +154,10 @@ ERROR_TYPE = {
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--schema", required=True)
+    p.add_argument("--schema")
     p.add_argument("--header-template", required=True)
     p.add_argument("--header-out", required=True)
+    p.add_argument("--public-header-out")
     p.add_argument("--schema-out", required=True)
     p.add_argument("--ipc-schema")
     p.add_argument("--abi-source")
@@ -187,6 +189,10 @@ def load_schema(path: Path) -> dict:
     cfg["endpoints"] = [normalize_endpoint(ep) for ep in cfg["endpoints"]]
     cfg["types"] = [dict(ty) for ty in cfg["types"]]
     return cfg
+
+
+def empty_schema() -> dict:
+    return {"endpoints": [], "types": []}
 
 
 def is_timesync_type(entry: dict) -> bool:
@@ -315,19 +321,102 @@ def c_doc(text: str) -> str:
 
 
 def render_c_enums(cfg: dict, result_members: list[tuple[str, int]]) -> str:
+    builtin_type_ids = {
+        "TELEMETRY_ERROR": 0,
+        "RELIABLE_ACK": 1,
+        "RELIABLE_PACKET_REQUEST": 2,
+        "RELIABLE_PARTIAL_ACK": 3,
+        "TIME_SYNC_ANNOUNCE": 4,
+        "TIME_SYNC_REQUEST": 5,
+        "TIME_SYNC_RESPONSE": 6,
+        "DISCOVERY_ANNOUNCE": 7,
+        "DISCOVERY_TIMESYNC_SOURCES": 8,
+        "DISCOVERY_TOPOLOGY": 9,
+        "DISCOVERY_SCHEMA": 10,
+        "DISCOVERY_TOPOLOGY_REQUEST": 11,
+        "DISCOVERY_SCHEMA_REQUEST": 12,
+        "MANAGED_VARIABLE_REQUEST": 13,
+        "MANAGED_VARIABLE_VALUE": 14,
+        "DISCOVERY_LEAVE": 15,
+        "DISCOVERY_LINK_CAPABILITIES": 16,
+    }
+    builtin_endpoint_ids = {
+        "TIME_SYNC": 200,
+        "DISCOVERY": 201,
+        "TELEMETRY_ERROR": 202,
+    }
     out: list[str] = []
     out.append("typedef enum SedsDataType {")
+    next_user_ty = 100
     for i, ty in enumerate(cfg["types"]):
         if ty.get("doc"):
             out.append(c_doc(ty["doc"]))
-        out.append(f"  SEDS_DT_{ty['name']} = {i},")
+        value = builtin_type_ids.get(ty["name"])
+        if value is None:
+            value = next_user_ty
+            next_user_ty += 1
+        out.append(f"  SEDS_DT_{ty['name']} = {value},")
     out.append("} SedsDataType;\n")
 
     out.append("typedef enum SedsDataEndpoint {")
+    next_user_ep = 100
     for i, ep in enumerate(cfg["endpoints"]):
         if ep.get("doc"):
             out.append(c_doc(ep["doc"]))
-        out.append(f"  SEDS_EP_{ep['name']} = {i},")
+        value = builtin_endpoint_ids.get(ep["name"])
+        if value is None:
+            value = next_user_ep
+            next_user_ep += 1
+        out.append(f"  SEDS_EP_{ep['name']} = {value},")
+    out.append("} SedsDataEndpoint;\n")
+
+    out.append("typedef enum SedsResult {")
+    for name, value in result_members:
+        out.append(f"  {name} = {value},")
+    out.append("} SedsResult;")
+    return "\n".join(out)
+
+
+def render_public_builtin_enums(result_members: list[tuple[str, int]]) -> str:
+    out: list[str] = []
+    out.append("typedef enum SedsDataType {")
+    out.append("  /* Time source announce (priority, time_ms). */")
+    out.append("  SEDS_DT_TIME_SYNC_ANNOUNCE = 4,")
+    out.append("  /* Time sync request (seq, t1_ms). */")
+    out.append("  SEDS_DT_TIME_SYNC_REQUEST = 5,")
+    out.append("  /* Time sync response (seq, t1_ms, t2_ms, t3_ms). */")
+    out.append("  SEDS_DT_TIME_SYNC_RESPONSE = 6,")
+    out.append("  /* Endpoint discovery advertisement (dynamic list of endpoint IDs). */")
+    out.append("  SEDS_DT_DISCOVERY_ANNOUNCE = 7,")
+    out.append("  /* Time sync source discovery advertisement (dynamic list of sender IDs). */")
+    out.append("  SEDS_DT_DISCOVERY_TIMESYNC_SOURCES = 8,")
+    out.append("  /* Full board-topology discovery advertisement (boards, endpoints, and connections). */")
+    out.append("  SEDS_DT_DISCOVERY_TOPOLOGY = 9,")
+    out.append("  /* Runtime schema snapshot advertisement. */")
+    out.append("  SEDS_DT_DISCOVERY_SCHEMA = 10,")
+    out.append("  /* Discovery request for current topology snapshot. */")
+    out.append("  SEDS_DT_DISCOVERY_TOPOLOGY_REQUEST = 11,")
+    out.append("  /* Discovery request for current runtime schema snapshot. */")
+    out.append("  SEDS_DT_DISCOVERY_SCHEMA_REQUEST = 12,")
+    out.append("  /* Request the latest cached value for a managed variable data type. */")
+    out.append("  SEDS_DT_MANAGED_VARIABLE_REQUEST = 13,")
+    out.append("  /* Reserved managed variable value control type. Values replay as their original data type. */")
+    out.append("  SEDS_DT_MANAGED_VARIABLE_VALUE = 14,")
+    out.append("  /* SEDSnet discovery leave announcement. */")
+    out.append("  SEDS_DT_DISCOVERY_LEAVE = 15,")
+    out.append("  /* Per-link compact transport capability advertisement. */")
+    out.append("  SEDS_DT_DISCOVERY_LINK_CAPABILITIES = 16,")
+    out.append("  /* Built-in TelemetryError */")
+    out.append("  SEDS_DT_TELEMETRY_ERROR = 0,")
+    out.append("} SedsDataType;\n")
+
+    out.append("typedef enum SedsDataEndpoint {")
+    out.append("  /* SEDSnet time sync routing endpoint (internal, always forwarded). */")
+    out.append("  SEDS_EP_TIME_SYNC = 200,")
+    out.append("  /* SEDSnet discovery control endpoint for internal route advertisements. */")
+    out.append("  SEDS_EP_DISCOVERY = 201,")
+    out.append("  /* SEDSnet error endpoint for internal error packets. */")
+    out.append("  SEDS_EP_TELEMETRY_ERROR = 202,")
     out.append("} SedsDataEndpoint;\n")
 
     out.append("typedef enum SedsResult {")
@@ -457,10 +546,27 @@ def render_generated_schema(cfg: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_header(template_path: Path, out_path: Path, cfg: dict, *, abi_text: str, result_members: list[tuple[str, int]]) -> None:
+def write_header(template_path: Path, out_path: Path, cfg: dict, *, abi_text: str, result_members: list[tuple[str, int]],
+                 public_builtins: bool = False) -> None:
     text = template_path.read_text(encoding="utf-8")
-    text = text.replace(HEADER_ENUMS_MARKER, render_c_enums(cfg, result_members))
+    enums = render_public_builtin_enums(result_members) if public_builtins else render_c_enums(cfg, result_members)
+    text = text.replace(HEADER_ENUMS_MARKER, enums)
     text = text.replace(HEADER_ABI_MARKER, abi_text)
+    if public_builtins:
+        text = text.replace("SEDSPRINTF_C_H", "SEDSNET_C_H")
+        text = re.sub(
+            r"/\* ============================================================================\n"
+            r"    THIS FILE IS AUTOGENERATED FROM RUST CONFIG - DO NOT EDIT DIRECTLY AS ALL CHANGES WILL BE OVERWRITTEN\n"
+            r"   ============================================================================ \*/",
+            "/* ============================================================================\n"
+            "    Static raw C/C++ ABI header for sedsnet.\n\n"
+            "    Runtime data types and endpoints are registered at runtime; this header only\n"
+            "    carries built-in IDs and ABI shapes.\n"
+            "   ============================================================================ */",
+            text,
+        )
+        text = text.replace("Public enums / constants *AUTOGENERATED BASED ON RUST CONFIG*",
+                            "Public built-in enums / constants. User schema entries are registered at runtime.")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
 
@@ -469,8 +575,9 @@ def main() -> None:
     args = parse_args()
     timesync_enabled = args.enable_timesync == "1"
     discovery_enabled = args.enable_discovery == "1"
+    base_schema = load_schema(Path(args.schema)) if args.schema else empty_schema()
     schema = finalize_schema(
-        load_schema(Path(args.schema)),
+        base_schema,
         ipc_schema=Path(args.ipc_schema) if args.ipc_schema else None,
         timesync_enabled=timesync_enabled,
         discovery_enabled=discovery_enabled,
@@ -484,6 +591,15 @@ def main() -> None:
         abi_text=abi_text,
         result_members=result_members,
     )
+    if args.public_header_out:
+        write_header(
+            Path(args.header_template),
+            Path(args.public_header_out),
+            schema,
+            abi_text=abi_text,
+            result_members=result_members,
+            public_builtins=True,
+        )
     Path(args.schema_out).write_text(render_generated_schema(schema), encoding="utf-8")
 
 

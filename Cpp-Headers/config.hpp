@@ -21,6 +21,11 @@ inline const TypeInfo* find_type_info(uint32_t ty) {
 }
 
 inline std::optional<uint32_t> endpoint_by_name(std::string_view name) {
+    for (uint32_t i = 100; i < kEndpointNames.size(); ++i) {
+        if (name == kEndpointNames[i]) {
+            return i;
+        }
+    }
     for (uint32_t i = 0; i < kEndpointNames.size(); ++i) {
         if (name == kEndpointNames[i]) {
             return i;

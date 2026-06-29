@@ -17,9 +17,15 @@ Non-goals in this repo:
 - Rust FFI implementation
 - Python bindings
 
-Generated metadata comes from:
-- `telemetry_config.json`
-- optional IPC overlay schema files
+Runtime metadata comes from:
+- direct endpoint/type registration through the C ABI
+- JSON bytes/file registration through the C ABI
+- optional startup seed files supplied through `SEDSNET_STATIC_SCHEMA_PATH` / `SEDSPRINTF_SCHEMA_PATH`
+- optional IPC overlay seed files supplied through `SEDSNET_STATIC_IPC_SCHEMA_PATH` / `SEDSPRINTF_IPC_SCHEMA_PATH`
+
+Without a schema path the build is generic and emits only the built-in control types and endpoints. The checked-in sample telemetry schema is a test fixture at `tests/schemas/default_test_schema.json`.
+
+Runtime APIs also configure router/relay memory budgets, device identity, compression threshold, string/binary sizing, float string precision, handler retries, reliable retransmit timing, reliable cache limits, and router address mode. `MAX_STACK_PAYLOAD` remains a compile-time capacity because it changes inline payload layout.
 
 The build regenerates:
 - `build/generated/sedsprintf.h`

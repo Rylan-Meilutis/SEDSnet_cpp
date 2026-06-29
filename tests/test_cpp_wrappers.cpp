@@ -1,13 +1,4 @@
-#include "c_api.hpp"
-#include "discovery_helpers.hpp"
-#include "config.hpp"
-#include "macros.hpp"
-#include "packet.hpp"
-#include "queue.hpp"
-#include "relay.hpp"
-#include "router.hpp"
-#include "small_payload.hpp"
-#include "timesync.hpp"
+#include "sedsnet_cpp_wrapper.hpp"
 
 #include <gtest/gtest.h>
 
@@ -179,6 +170,12 @@ TEST(CppWrapperTest, TimeSyncHelpersRoundTripAndMath) {
 }
 
 TEST(CppWrapperTest, MirrorHeadersExposeExpectedGlue) {
+    SedsTypeRef gps_ref{};
+    const SedsName gps_name{"GPS_DATA", 8};
+    ASSERT_EQ(seds::type_ref_by_name(gps_name, gps_ref), SEDS_OK);
+    ASSERT_TRUE(seds::exists(gps_ref));
+    ASSERT_EQ(seds::expected_size(gps_ref), 12);
+
     const auto mode_value = seds::to_underlying(Seds_RM_Sink);
     ASSERT_EQ(mode_value, 0);
 

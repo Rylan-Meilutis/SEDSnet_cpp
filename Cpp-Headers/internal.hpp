@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <cmath>
 #include <deque>
 #include <functional>
 #include <map>
@@ -21,6 +22,10 @@
 namespace seds
 {
   constexpr size_t kCompressionThreshold = 128;
+  constexpr size_t kStaticStringLength = 1024;
+  constexpr size_t kStaticHexLength = 1024;
+  constexpr size_t kStringPrecision = 8;
+  constexpr size_t kMaxHandlerRetries = 3;
   constexpr uint8_t kFlagCompressedPayload = 0x01;
   constexpr uint8_t kFlagCompressedSender = 0x02;
   constexpr uint8_t kReliableFlagAckOnly = 0x01;
@@ -32,6 +37,7 @@ namespace seds
   constexpr uint64_t kDiscoverySlowMs = 5000;
   constexpr uint64_t kDiscoveryTtlMs = 30000;
   constexpr size_t kStartingQueueBytes = 64;
+  constexpr double kQueueGrowStep = 3.2;
 #ifndef SEDSPRINTF_MAX_RECENT_RX_IDS
   constexpr size_t kMaxRecentRxIds = 128;
 #else
@@ -47,7 +53,58 @@ namespace seds
   constexpr size_t kMaxQueueBytes = kMaxQueueBudget;
   constexpr uint64_t kReliableRetransmitMs = 200;
   constexpr uint32_t kReliableMaxRetries = 8;
-  constexpr size_t kReliableMaxPending = 16;
+  constexpr size_t kReliableMaxPending = 32;
+  constexpr size_t kReliableMaxReturnRoutes = kMaxRecentRxIds;
+  constexpr size_t kReliableMaxEndToEndPending = kReliableMaxPending;
+  constexpr size_t kReliableMaxEndToEndAckCache = kMaxRecentRxIds;
+  constexpr uint32_t kDiscoveryLeaveType = 1015;
+
+  inline SedsRuntimeMemoryConfig default_runtime_memory_config()
+  {
+    return SedsRuntimeMemoryConfig{kMaxQueueBudget, kMaxRecentRxIds, kStartingQueueBytes, kQueueGrowStep};
+  }
+
+  inline bool validate_runtime_memory_config(const SedsRuntimeMemoryConfig & cfg)
+  {
+    return cfg.max_queue_budget != 0 && cfg.max_recent_rx_ids != 0 && cfg.starting_queue_size != 0 &&
+           cfg.starting_queue_size <= cfg.max_queue_budget && std::isfinite(cfg.queue_grow_step) &&
+           cfg.queue_grow_step > 1.0;
+  }
+
+  inline size_t recent_rx_queue_bytes(const SedsRuntimeMemoryConfig & cfg)
+  {
+    const size_t requested = cfg.max_recent_rx_ids > (static_cast<size_t>(-1) / sizeof(uint64_t))
+                                 ? static_cast<size_t>(-1)
+                                 : cfg.max_recent_rx_ids * sizeof(uint64_t);
+    const size_t capped = requested < cfg.max_queue_budget ? requested : cfg.max_queue_budget;
+    return capped == 0 ? 1 : capped;
+  }
+
+  SedsRuntimeTuningConfig runtime_tuning_config();
+
+  std::string runtime_device_identifier();
+
+  size_t runtime_payload_compress_threshold();
+
+  size_t runtime_static_string_length();
+
+  size_t runtime_static_hex_length();
+
+  size_t runtime_string_precision();
+
+  size_t runtime_max_handler_retries();
+
+  uint32_t runtime_reliable_retransmit_ms();
+
+  uint32_t runtime_reliable_max_retries();
+
+  size_t runtime_reliable_max_pending();
+
+  size_t runtime_reliable_max_return_routes();
+
+  size_t runtime_reliable_max_end_to_end_pending();
+
+  size_t runtime_reliable_max_end_to_end_ack_cache();
 
   enum class ElementDataType : uint8_t
   {
@@ -98,9 +155,10 @@ namespace seds
     [[nodiscard]] bool reliable() const { return reliable_mode != ReliableMode::None; }
   };
 
-  extern const std::vector<TypeInfo> kTypeInfo;
-  extern const uint32_t kEndpointCount;
-  extern const std::vector<const char *> kEndpointNames;
+  extern std::vector<TypeInfo> kTypeInfo;
+  extern uint32_t kEndpointCount;
+  extern std::vector<const char *> kEndpointNames;
+  void ensure_runtime_schema_loaded();
 
   struct PacketData
   {
@@ -152,6 +210,11 @@ namespace seds
     bool link_local_enabled{};
     bool ingress_enabled{true};
     bool egress_enabled{true};
+    bool header_template_enabled{};
+    size_t max_frame_bytes{};
+    size_t compact_header_target_bytes{};
+    size_t max_side_transport_templates{64};
+    SedsSideTransportProfile side_transport_profile{SEDS_SIDE_TRANSPORT_PROFILE_CANONICAL};
   };
 
   struct DiscoveryRoute
@@ -173,7 +236,7 @@ namespace seds
   inline constexpr bool is_discovery_control_type(const uint32_t ty)
   {
     return ty == SEDS_DT_DISCOVERY_ANNOUNCE || ty == SEDS_DT_DISCOVERY_TIMESYNC_SOURCES ||
-           ty == SEDS_DT_DISCOVERY_TOPOLOGY;
+           ty == SEDS_DT_DISCOVERY_TOPOLOGY || ty == kDiscoveryLeaveType;
   }
 
   struct RouteKey
@@ -256,6 +319,49 @@ namespace seds
     bool queued{false};
   };
 
+  struct ManagedVariableEntry
+  {
+    PacketData pkt;
+    std::vector<uint8_t> packed;
+    uint64_t updated_ms{};
+  };
+
+  struct ManagedVariablePolicy
+  {
+    bool enabled{};
+    bool can_read{true};
+    bool can_write{true};
+  };
+
+  struct ManagedVariableCallback
+  {
+    SedsEndpointHandlerFn cb{};
+    void * user{};
+  };
+
+  struct P2pPortHandler
+  {
+    SedsP2pHandlerFn cb{};
+    void * user{};
+  };
+
+  struct P2pStreamHandler
+  {
+    SedsP2pStreamHandlerFn cb{};
+    void * user{};
+  };
+
+  struct P2pStreamSession
+  {
+    std::string peer_hostname;
+    uint32_t peer_address{};
+    uint16_t local_port{};
+    uint16_t peer_port{};
+    uint32_t peer_stream_id{};
+    uint32_t next_sequence{1};
+    bool connected{};
+  };
+
   struct TimeSyncRuntime
   {
     bool enabled{false};
@@ -311,6 +417,12 @@ namespace seds
 
   uint32_t crc32_bytes(const uint8_t * data, size_t len);
 
+  uint64_t hash_bytes_u64(uint64_t h, const uint8_t * data, size_t len);
+
+  uint32_t wire_type_id(uint32_t local);
+
+  std::optional<uint32_t> local_type_from_wire_id(uint32_t wire);
+
   void write_uleb128(uint64_t value, std::vector<uint8_t> & out);
 
   bool read_uleb128(const uint8_t *& cur, const uint8_t * end, uint64_t & out);
@@ -362,9 +474,40 @@ namespace seds
 
   bool enqueue_tx_front(std::deque<TxItem> & queue, size_t & queue_bytes, TxItem item);
 
+  bool enqueue_tx(std::deque<TxItem> & queue, size_t & queue_bytes, TxItem item, size_t max_queue_budget);
+
+  bool enqueue_tx_front(std::deque<TxItem> & queue, size_t & queue_bytes, TxItem item, size_t max_queue_budget);
+
   bool enqueue_rx(std::deque<RxItem> & queue, size_t & queue_bytes, RxItem item);
 
   bool enqueue_rx_front(std::deque<RxItem> & queue, size_t & queue_bytes, RxItem item);
+
+  bool enqueue_rx(std::deque<RxItem> & queue, size_t & queue_bytes, RxItem item, size_t max_queue_budget);
+
+  bool enqueue_rx_front(std::deque<RxItem> & queue, size_t & queue_bytes, RxItem item, size_t max_queue_budget);
+
+  template<typename OwnerT>
+  void enforce_shared_queue_budget(OwnerT & owner)
+  {
+    const size_t budget = owner.memory.max_queue_budget;
+    while (owner.rx_queue_bytes + owner.tx_queue_bytes > budget)
+    {
+      if (!owner.rx_queue.empty() && (owner.tx_queue.empty() || owner.rx_queue_bytes >= owner.tx_queue_bytes))
+      {
+        owner.rx_queue_bytes -= byte_cost(owner.rx_queue.front());
+        owner.rx_queue.pop_front();
+      }
+      else if (!owner.tx_queue.empty())
+      {
+        owner.tx_queue_bytes -= byte_cost(owner.tx_queue.front());
+        owner.tx_queue.pop_front();
+      }
+      else
+      {
+        break;
+      }
+    }
+  }
 
   std::optional<TxItem> pop_tx(std::deque<TxItem> & queue, size_t & queue_bytes);
 
@@ -549,6 +692,7 @@ struct SedsRouter
   std::deque<seds::TxItem> tx_queue;
   std::deque<seds::RxItem> rx_queue;
   std::vector<seds::RxItem> reliable_released_rx;
+  SedsRuntimeMemoryConfig memory{seds::default_runtime_memory_config()};
   size_t tx_queue_bytes{};
   size_t rx_queue_bytes{};
   std::deque<uint64_t> recent_ids;
@@ -563,7 +707,19 @@ struct SedsRouter
   std::unordered_map<uint64_t, seds::ReliableTxState> reliable_tx;
   std::unordered_map<uint64_t, seds::ReliableRxState> reliable_rx;
   std::unordered_map<uint64_t, seds::ReliableReturnRouteState> reliable_return_routes;
+  std::deque<uint64_t> reliable_return_route_order;
   std::unordered_map<uint64_t, seds::EndToEndReliableSent> end_to_end_reliable_tx;
+  std::deque<uint64_t> end_to_end_reliable_tx_order;
+  std::unordered_map<uint32_t, seds::ManagedVariablePolicy> managed_variable_policy;
+  std::unordered_map<uint32_t, seds::ManagedVariableEntry> managed_variable_latest;
+  std::unordered_map<uint32_t, seds::ManagedVariableCallback> managed_variable_callbacks;
+  uint32_t p2p_address{};
+  std::unordered_map<std::string, uint32_t> p2p_address_book;
+  std::unordered_map<uint32_t, std::string> p2p_host_by_address;
+  std::unordered_map<uint16_t, std::vector<seds::P2pPortHandler>> p2p_handlers;
+  std::unordered_map<uint16_t, std::vector<seds::P2pStreamHandler>> p2p_stream_handlers;
+  std::unordered_map<uint32_t, seds::P2pStreamSession> p2p_stream_sessions;
+  uint32_t p2p_next_stream_id{1};
   std::string sender;
   std::string node_sender;
   seds::TimeSyncRuntime timesync;
@@ -576,6 +732,8 @@ struct SedsRouter
   uint64_t current_network_ms() const;
 };
 
+SedsResult seds_router_dispatch_p2p_packet(SedsRouter & r, const seds::PacketData & pkt);
+
 struct SedsRelay
 {
   SedsNowMsFn now_ms_cb{};
@@ -584,6 +742,7 @@ struct SedsRelay
   std::deque<seds::TxItem> tx_queue;
   std::deque<seds::RxItem> rx_queue;
   std::vector<seds::RxItem> reliable_released_rx;
+  SedsRuntimeMemoryConfig memory{seds::default_runtime_memory_config()};
   size_t tx_queue_bytes{};
   size_t rx_queue_bytes{};
   std::deque<uint64_t> recent_ids;
@@ -598,7 +757,9 @@ struct SedsRelay
   std::unordered_map<uint64_t, seds::ReliableTxState> reliable_tx;
   std::unordered_map<uint64_t, seds::ReliableRxState> reliable_rx;
   std::unordered_map<uint64_t, seds::ReliableReturnRouteState> reliable_return_routes;
+  std::deque<uint64_t> reliable_return_route_order;
   std::unordered_map<uint64_t, std::unordered_set<uint64_t> > end_to_end_acked_destinations;
+  std::deque<uint64_t> end_to_end_acked_destination_order;
   bool side_tx_active{};
   bool side_tx_deferred{};
   mutable std::recursive_mutex mu;

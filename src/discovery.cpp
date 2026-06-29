@@ -74,6 +74,43 @@ bool prune_discovery_routes(RouteMapT& routes, uint64_t now_ms) {
     return changed;
 }
 
+template <typename RouteMapT>
+bool prune_leaving_discovery_sender(RouteMapT& routes, const std::string& leaving) {
+    bool changed = false;
+    for (auto route_it = routes.begin(); route_it != routes.end();) {
+        auto& route = route_it->second;
+        if (route.announcers.erase(leaving) != 0) {
+            changed = true;
+        }
+        for (auto& [_, sender_state] : route.announcers) {
+            const auto before_boards = sender_state.topology_boards;
+            sender_state.topology_boards.erase(
+                std::remove_if(sender_state.topology_boards.begin(),
+                               sender_state.topology_boards.end(),
+                               [&](const TopologyBoardNode& board) {
+                                   return board.sender_id == leaving;
+                               }),
+                sender_state.topology_boards.end());
+            for (auto& board : sender_state.topology_boards) {
+                board.connections.erase(
+                    std::remove(board.connections.begin(), board.connections.end(), leaving),
+                    board.connections.end());
+            }
+            if (sender_state.topology_boards != before_boards) {
+                changed = true;
+                refresh_sender_topology_state(sender_state);
+            }
+        }
+        recompute_discovery_side_state(route);
+        if (route.announcers.empty()) {
+            route_it = routes.erase(route_it);
+        } else {
+            ++route_it;
+        }
+    }
+    return changed;
+}
+
 template <typename OwnerT>
 void note_discovery_topology_change(OwnerT& owner, uint64_t now_ms) {
     owner.discovery_interval_ms = kDiscoveryFastMs;
@@ -286,7 +323,8 @@ void queue_discovery_packets(SedsRouter& r) {
         auto timesync_sources = advertised_timesync_sources_for_side(r, static_cast<int32_t>(side_id));
         if (topology_pkt.has_value()) {
             enqueue_tx_front(r.tx_queue, r.tx_queue_bytes,
-                             {std::move(*topology_pkt), std::nullopt, static_cast<int32_t>(side_id), false});
+                             {std::move(*topology_pkt), std::nullopt, static_cast<int32_t>(side_id), false},
+                             r.memory.max_queue_budget);
         }
         if (!timesync_sources.empty()) {
             std::vector<uint8_t> ts_payload;
@@ -298,7 +336,8 @@ void queue_discovery_packets(SedsRouter& r) {
             auto pkt = make_internal_packet(SEDS_DT_DISCOVERY_TIMESYNC_SOURCES, now, std::move(ts_payload));
             pkt.sender = r.sender;
             enqueue_tx_front(r.tx_queue, r.tx_queue_bytes,
-                             {std::move(pkt), std::nullopt, static_cast<int32_t>(side_id), false});
+                             {std::move(pkt), std::nullopt, static_cast<int32_t>(side_id), false},
+                             r.memory.max_queue_budget);
         }
         std::vector<uint8_t> payload;
         for (const uint32_t ep : advertised_endpoints_for_side(r, static_cast<int32_t>(side_id))) {
@@ -307,7 +346,8 @@ void queue_discovery_packets(SedsRouter& r) {
         auto pkt = make_internal_packet(SEDS_DT_DISCOVERY_ANNOUNCE, now, std::move(payload));
         pkt.sender = r.sender;
         enqueue_tx_front(r.tx_queue, r.tx_queue_bytes,
-                         {std::move(pkt), std::nullopt, static_cast<int32_t>(side_id), false});
+                         {std::move(pkt), std::nullopt, static_cast<int32_t>(side_id), false},
+                         r.memory.max_queue_budget);
     }
     r.discovery_next_ms = now + r.discovery_interval_ms;
     r.discovery_interval_ms = std::min<uint64_t>(r.discovery_interval_ms * 2u, kDiscoverySlowMs);
@@ -332,7 +372,8 @@ void queue_discovery_packets(SedsRelay& r) {
         auto timesync_sources = advertised_timesync_sources_for_side(r, static_cast<int32_t>(side_id));
         if (topology_pkt.has_value()) {
             enqueue_tx_front(r.tx_queue, r.tx_queue_bytes,
-                             {std::move(*topology_pkt), std::nullopt, static_cast<int32_t>(side_id), false});
+                             {std::move(*topology_pkt), std::nullopt, static_cast<int32_t>(side_id), false},
+                             r.memory.max_queue_budget);
         }
         if (!timesync_sources.empty()) {
             std::vector<uint8_t> ts_payload;
@@ -344,7 +385,8 @@ void queue_discovery_packets(SedsRelay& r) {
             auto pkt = make_internal_packet(SEDS_DT_DISCOVERY_TIMESYNC_SOURCES, now, std::move(ts_payload));
             pkt.sender = "RELAY";
             enqueue_tx_front(r.tx_queue, r.tx_queue_bytes,
-                             {std::move(pkt), std::nullopt, static_cast<int32_t>(side_id), false});
+                             {std::move(pkt), std::nullopt, static_cast<int32_t>(side_id), false},
+                             r.memory.max_queue_budget);
         }
         std::vector<uint8_t> payload;
         for (const uint32_t ep : advertised_endpoints_for_side(r, static_cast<int32_t>(side_id))) {
@@ -353,7 +395,8 @@ void queue_discovery_packets(SedsRelay& r) {
         auto pkt = make_internal_packet(SEDS_DT_DISCOVERY_ANNOUNCE, now, std::move(payload));
         pkt.sender = "RELAY";
         enqueue_tx_front(r.tx_queue, r.tx_queue_bytes,
-                         {std::move(pkt), std::nullopt, static_cast<int32_t>(side_id), false});
+                         {std::move(pkt), std::nullopt, static_cast<int32_t>(side_id), false},
+                         r.memory.max_queue_budget);
     }
     r.discovery_next_ms = now + r.discovery_interval_ms;
     r.discovery_interval_ms = std::min<uint64_t>(r.discovery_interval_ms * 2u, kDiscoverySlowMs);
@@ -361,6 +404,12 @@ void queue_discovery_packets(SedsRelay& r) {
 
 void handle_discovery_packet(SedsRouter& r, const PacketData& pkt, std::optional<int32_t> src_side) {
     if (!src_side || pkt.sender == r.sender) {
+        return;
+    }
+    if (pkt.ty == kDiscoveryLeaveType) {
+        if (prune_leaving_discovery_sender(r.discovery_routes, pkt.sender)) {
+            note_discovery_topology_change(r, r.now_ms());
+        }
         return;
     }
     DiscoveryRoute next = r.discovery_routes[*src_side];
@@ -412,6 +461,12 @@ void handle_discovery_packet(SedsRouter& r, const PacketData& pkt, std::optional
 
 void handle_discovery_packet(SedsRelay& r, const PacketData& pkt, std::optional<int32_t> src_side) {
     if (!src_side) {
+        return;
+    }
+    if (pkt.ty == kDiscoveryLeaveType) {
+        if (prune_leaving_discovery_sender(r.discovery_routes, pkt.sender)) {
+            note_discovery_topology_change(r, r.now_ms());
+        }
         return;
     }
     DiscoveryRoute next = r.discovery_routes[*src_side];

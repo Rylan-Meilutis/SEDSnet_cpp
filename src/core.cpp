@@ -13,9 +13,158 @@
 
 namespace seds
 {
-  const std::vector<TypeInfo> kTypeInfo = generated::make_type_info();
-  const uint32_t kEndpointCount = generated::kEndpointCountValue;
-  const std::vector<const char *> kEndpointNames = generated::make_endpoint_names();
+  namespace
+  {
+    uint32_t runtime_endpoint_id_for_name(std::string_view name, uint32_t legacy)
+    {
+      if (name == "TIME_SYNC")
+        return 200;
+      if (name == "DISCOVERY")
+        return 201;
+      if (name == "TELEMETRY_ERROR")
+        return 202;
+      return 100u + legacy;
+    }
+
+    std::optional<uint32_t> runtime_user_type_id_for_name(std::string_view name, uint32_t legacy)
+    {
+      if (name == "TELEMETRY_ERROR")
+        return std::nullopt;
+      if (name == "RELIABLE_ACK")
+        return std::nullopt;
+      if (name == "RELIABLE_PACKET_REQUEST")
+        return std::nullopt;
+      if (name == "RELIABLE_PARTIAL_ACK")
+        return std::nullopt;
+      if (name == "TIME_SYNC_ANNOUNCE")
+        return std::nullopt;
+      if (name == "TIME_SYNC_REQUEST")
+        return std::nullopt;
+      if (name == "TIME_SYNC_RESPONSE")
+        return std::nullopt;
+      if (name == "DISCOVERY_ANNOUNCE")
+        return std::nullopt;
+      if (name == "DISCOVERY_TIMESYNC_SOURCES")
+        return std::nullopt;
+      if (name == "DISCOVERY_TOPOLOGY")
+        return std::nullopt;
+      return 100u + legacy;
+    }
+
+    std::vector<const char *> make_runtime_endpoint_names()
+    {
+      auto names = generated::make_endpoint_names();
+      const auto legacy = names;
+      for (uint32_t i = 0; i < legacy.size(); ++i)
+      {
+        const uint32_t runtime = runtime_endpoint_id_for_name(legacy[i], i);
+        if (names.size() <= runtime)
+        {
+          names.resize(runtime + 1u, nullptr);
+        }
+        names[runtime] = legacy[i];
+      }
+      return names;
+    }
+
+    std::vector<TypeInfo> make_runtime_type_info()
+    {
+      auto types = generated::make_type_info();
+      const auto legacy = types;
+      const auto endpoint_names = generated::make_endpoint_names();
+      uint32_t discovery_endpoint = 201;
+      for (uint32_t i = 0; i < endpoint_names.size(); ++i)
+      {
+        if (endpoint_names[i] != nullptr && std::string_view(endpoint_names[i]) == "DISCOVERY")
+        {
+          discovery_endpoint = runtime_endpoint_id_for_name(endpoint_names[i], i);
+          break;
+        }
+      }
+      const auto add_builtin = [&](uint32_t local, const char * name, ReliableMode reliable, uint8_t priority = 240)
+      {
+        if (types.size() <= local)
+        {
+          types.resize(local + 1u, TypeInfo{"", 0, 0, false, ReliableMode::None, ElementDataType::NoData,
+                                            MessageClass::Data, false, {}});
+        }
+        types[local] = TypeInfo{name, 1, 0, true, reliable, ElementDataType::UInt8, MessageClass::Data, false,
+                                {discovery_endpoint}};
+      };
+      const auto copy_builtin = [&](uint32_t local, std::string_view name)
+      {
+        const auto it = std::find_if(legacy.begin(), legacy.end(), [&](const TypeInfo & info)
+        {
+          return info.name != nullptr && name == info.name;
+        });
+        if (it == legacy.end())
+        {
+          return;
+        }
+        if (types.size() <= local)
+        {
+          types.resize(local + 1u, TypeInfo{"", 0, 0, false, ReliableMode::None, ElementDataType::NoData,
+                                            MessageClass::Data, false, {}});
+        }
+        auto remapped = *it;
+        for (auto & endpoint: remapped.endpoints)
+        {
+          if (endpoint < endpoint_names.size() && endpoint_names[endpoint] != nullptr)
+          {
+            endpoint = runtime_endpoint_id_for_name(endpoint_names[endpoint], endpoint);
+          }
+        }
+        types[local] = remapped;
+      };
+      copy_builtin(0, "TELEMETRY_ERROR");
+      copy_builtin(1, "RELIABLE_ACK");
+      copy_builtin(2, "RELIABLE_PACKET_REQUEST");
+      copy_builtin(3, "RELIABLE_PARTIAL_ACK");
+      copy_builtin(4, "TIME_SYNC_ANNOUNCE");
+      copy_builtin(5, "TIME_SYNC_REQUEST");
+      copy_builtin(6, "TIME_SYNC_RESPONSE");
+      copy_builtin(7, "DISCOVERY_ANNOUNCE");
+      copy_builtin(8, "DISCOVERY_TIMESYNC_SOURCES");
+      copy_builtin(9, "DISCOVERY_TOPOLOGY");
+      for (uint32_t i = 0; i < legacy.size(); ++i)
+      {
+        const auto runtime_opt = runtime_user_type_id_for_name(legacy[i].name, i);
+        if (!runtime_opt)
+        {
+          continue;
+        }
+        const uint32_t runtime = *runtime_opt;
+        if (types.size() <= runtime)
+        {
+          types.resize(runtime + 1u, TypeInfo{"", 0, 0, false, ReliableMode::None, ElementDataType::NoData,
+                                              MessageClass::Data, false, {}});
+        }
+        auto remapped = legacy[i];
+        for (auto & endpoint: remapped.endpoints)
+        {
+          if (endpoint < endpoint_names.size() && endpoint_names[endpoint] != nullptr)
+          {
+            endpoint = runtime_endpoint_id_for_name(endpoint_names[endpoint], endpoint);
+          }
+        }
+        types[runtime] = remapped;
+      }
+      add_builtin(1010, "SEDSNET_DISCOVERY_SCHEMA", ReliableMode::None);
+      add_builtin(1011, "SEDSNET_DISCOVERY_TOPOLOGY_REQUEST", ReliableMode::None);
+      add_builtin(1012, "SEDSNET_DISCOVERY_SCHEMA_REQUEST", ReliableMode::None);
+      add_builtin(1013, "SEDSNET_MANAGED_VARIABLE_REQUEST", ReliableMode::Ordered, 242);
+      add_builtin(1014, "SEDSNET_MANAGED_VARIABLE_VALUE", ReliableMode::Ordered, 243);
+      add_builtin(1015, "SEDSNET_DISCOVERY_LEAVE", ReliableMode::None, 244);
+      add_builtin(1016, "SEDSNET_DISCOVERY_LINK_CAPABILITIES", ReliableMode::None);
+      add_builtin(1017, "SEDSNET_DISCOVERY_ADDRESS", ReliableMode::Ordered, 244);
+      add_builtin(1018, "SEDSNET_P2P_MESSAGE", ReliableMode::Ordered, 246);
+      return types;
+    }
+  } // namespace
+
+  std::vector<TypeInfo> kTypeInfo = make_runtime_type_info();
+  uint32_t kEndpointCount = static_cast<uint32_t>(make_runtime_endpoint_names().size());
+  std::vector<const char *> kEndpointNames = make_runtime_endpoint_names();
 
   size_t RouteKeyHash::operator()(const RouteKey & key) const noexcept
   {
@@ -35,8 +184,17 @@ namespace seds
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
   }
 
-  bool valid_type(uint32_t ty) { return ty < kTypeInfo.size(); }
-  bool valid_endpoint(uint32_t ep) { return ep < kEndpointCount; }
+  bool valid_type(uint32_t ty)
+  {
+    ensure_runtime_schema_loaded();
+    return ty < kTypeInfo.size() && kTypeInfo[ty].name != nullptr && kTypeInfo[ty].name[0] != '\0';
+  }
+
+  bool valid_endpoint(uint32_t ep)
+  {
+    ensure_runtime_schema_loaded();
+    return ep < kEndpointNames.size() && kEndpointNames[ep] != nullptr;
+  }
 
   uint32_t crc32_bytes(const uint8_t * data, size_t len)
   {
@@ -129,7 +287,21 @@ namespace seds
 
   bool packet_from_view(const SedsPacketView * view, PacketData & out)
   {
-    if (view == nullptr || !valid_type(view->ty) || view->endpoints == nullptr || view->num_endpoints == 0)
+    if (view == nullptr || view->endpoints == nullptr || view->num_endpoints == 0)
+    {
+      return false;
+    }
+    uint32_t ty = view->ty;
+    if (!valid_type(ty))
+    {
+      const auto local = local_type_from_wire_id(ty);
+      if (!local || !valid_type(*local))
+      {
+        return false;
+      }
+      ty = *local;
+    }
+    if (!valid_type(ty))
     {
       return false;
     }
@@ -144,7 +316,7 @@ namespace seds
     {
       return false;
     }
-    out.ty = view->ty;
+    out.ty = ty;
     out.sender.assign(view->sender ? view->sender : "", view->sender_len);
     out.endpoints.assign(view->endpoints, view->endpoints + view->num_endpoints);
     out.timestamp = view->timestamp;
@@ -184,8 +356,9 @@ namespace seds
     switch (info.data_type)
     {
       case ElementDataType::String:
+        return bytes <= runtime_static_string_length();
       case ElementDataType::Binary:
-        return true;
+        return bytes <= runtime_static_hex_length();
       case ElementDataType::NoData:
         return bytes == 0;
       default:
@@ -253,7 +426,7 @@ namespace seds
   {
     PacketData pkt;
     pkt.ty = ty;
-    pkt.sender = "CPP";
+    pkt.sender = runtime_device_identifier();
     pkt.endpoints = kTypeInfo[ty].endpoints;
     pkt.timestamp = ts;
     pkt.payload = std::move(payload);
@@ -263,12 +436,23 @@ namespace seds
   PacketData make_reliable_control_packet(const uint32_t control_ty, const uint32_t ty, const uint32_t seq,
                                           const uint64_t ts, const std::string_view sender)
   {
+    const auto telemetry_error_endpoint = [&]() -> std::vector<uint32_t>
+    {
+      for (uint32_t i = 0; i < kEndpointNames.size(); ++i)
+      {
+        if (kEndpointNames[i] != nullptr && std::string_view(kEndpointNames[i]) == "TELEMETRY_ERROR")
+        {
+          return {i};
+        }
+      }
+      return kTypeInfo[control_ty].endpoints;
+    };
     PacketData pkt;
     pkt.ty = control_ty;
     pkt.sender = std::string(sender);
-    pkt.endpoints = kTypeInfo[control_ty].endpoints;
+    pkt.endpoints = telemetry_error_endpoint();
     pkt.timestamp = ts;
-    append_le<uint32_t>(ty, pkt.payload);
+    append_le<uint32_t>(wire_type_id(ty), pkt.payload);
     append_le<uint32_t>(seq, pkt.payload);
     return pkt;
   }
@@ -316,7 +500,7 @@ namespace seds
     }
     PacketData pkt;
     pkt.ty = SEDS_DT_TELEMETRY_ERROR;
-    pkt.sender = "CPP";
+    pkt.sender = runtime_device_identifier();
     pkt.endpoints = std::move(endpoints);
     pkt.timestamp = 0;
     pkt.payload.assign(message.begin(), message.end());
@@ -520,7 +704,7 @@ namespace seds
 
 SedsRouter::SedsRouter(SedsRouterMode router_mode) : mode(router_mode)
 {
-  sender = "CPP";
+  sender = seds::runtime_device_identifier();
   node_sender = sender;
 }
 

@@ -35,7 +35,7 @@ void handle_timesync_packet(SedsRouter& r, const PacketData& pkt, std::optional<
             auto pkt = make_internal_packet(SEDS_DT_TIME_SYNC_RESPONSE, now, std::move(resp));
             pkt.sender = r.sender;
             enqueue_tx(r.tx_queue, r.tx_queue_bytes,
-                       {std::move(pkt), std::nullopt, src_side, false});
+                       {std::move(pkt), std::nullopt, src_side, false}, r.memory.max_queue_budget);
         }
     } else if (pkt.ty == SEDS_DT_TIME_SYNC_RESPONSE && pkt.payload.size() >= 32) {
         uint64_t t3 = 0;

@@ -1,0 +1,22 @@
+{
+  "endpoints": [
+    {
+      "rust": "EnvIpcEndpoint",
+      "name": "ENV_IPC_ENDPOINT"
+    }
+  ],
+  "types": [
+    {
+      "rust": "EnvIpcType",
+      "name": "ENV_IPC_TYPE",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt32",
+        "count": 1
+      },
+      "endpoints": [
+        "EnvIpcEndpoint"
+      ]
+    }
+  ]
+}

@@ -56,7 +56,6 @@ namespace seds
         }
 
         constexpr uint64_t kEpochMsThreshold = 1'000'000'000'000ull;
-        constexpr int kStringPrecision = 8;
 
         template<typename T>
         T read_le_value(const uint8_t * data)
@@ -135,7 +134,7 @@ namespace seds
 
         std::string endpoint_name(uint32_t ep)
         {
-            if (ep < kEndpointNames.size())
+            if (ep < kEndpointNames.size() && kEndpointNames[ep] != nullptr)
             {
                 return kEndpointNames[ep];
             }
@@ -155,7 +154,8 @@ namespace seds
                 first = false;
                 if constexpr (std::is_same_v<T, float> || std::is_same_v<T, double>)
                 {
-                    os << std::fixed << std::setprecision(kStringPrecision) << read_le_value<T>(data + off);
+                    os << std::fixed << std::setprecision(static_cast<int>(runtime_string_precision()))
+                       << read_le_value<T>(data + off);
                 }
                 else if constexpr (std::is_same_v<T, uint8_t> || std::is_same_v<T, int8_t>)
                 {
@@ -514,14 +514,16 @@ SedsOwnedPacket * seds_pkt_deserialize_owned(const uint8_t * bytes, size_t len)
 
 SedsOwnedHeader * seds_pkt_deserialize_header_owned(const uint8_t * bytes, size_t len)
 {
-    auto pkt = seds::deserialize_packet(bytes, len);
-    if (!pkt)
+    auto frame = seds::peek_frame_info(bytes, len, true);
+    if (!frame)
     {
         return nullptr;
     }
-    pkt->payload.clear();
     auto owned = std::make_unique<SedsOwnedHeader>();
-    owned->pkt = std::move(*pkt);
+    owned->pkt.ty = frame->envelope.ty;
+    owned->pkt.sender = std::move(frame->envelope.sender);
+    owned->pkt.endpoints = std::move(frame->envelope.endpoints);
+    owned->pkt.timestamp = frame->envelope.timestamp_ms;
     return owned.release();
 }
 

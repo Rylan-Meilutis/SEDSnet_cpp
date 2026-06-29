@@ -4,12 +4,12 @@ namespace seds {
 namespace {
 
 template <typename ItemT>
-bool enqueue_bounded(std::deque<ItemT>& queue, size_t& queue_bytes, ItemT item, bool front) {
+bool enqueue_bounded(std::deque<ItemT>& queue, size_t& queue_bytes, ItemT item, bool front, size_t max_queue_budget) {
     const size_t cost = byte_cost(item);
-    if (cost > kMaxQueueBudget) {
+    if (cost > max_queue_budget) {
         return false;
     }
-    while (!queue.empty() && queue_bytes + cost > kMaxQueueBudget) {
+    while (!queue.empty() && queue_bytes + cost > max_queue_budget) {
         queue_bytes -= byte_cost(queue.front());
         queue.pop_front();
     }
@@ -38,19 +38,35 @@ size_t byte_cost(const RxItem& item) {
 }
 
 bool enqueue_tx(std::deque<TxItem>& queue, size_t& queue_bytes, TxItem item) {
-    return enqueue_bounded(queue, queue_bytes, std::move(item), false);
+    return enqueue_tx(queue, queue_bytes, std::move(item), kMaxQueueBudget);
 }
 
 bool enqueue_tx_front(std::deque<TxItem>& queue, size_t& queue_bytes, TxItem item) {
-    return enqueue_bounded(queue, queue_bytes, std::move(item), true);
+    return enqueue_tx_front(queue, queue_bytes, std::move(item), kMaxQueueBudget);
+}
+
+bool enqueue_tx(std::deque<TxItem>& queue, size_t& queue_bytes, TxItem item, size_t max_queue_budget) {
+    return enqueue_bounded(queue, queue_bytes, std::move(item), false, max_queue_budget);
+}
+
+bool enqueue_tx_front(std::deque<TxItem>& queue, size_t& queue_bytes, TxItem item, size_t max_queue_budget) {
+    return enqueue_bounded(queue, queue_bytes, std::move(item), true, max_queue_budget);
 }
 
 bool enqueue_rx(std::deque<RxItem>& queue, size_t& queue_bytes, RxItem item) {
-    return enqueue_bounded(queue, queue_bytes, std::move(item), false);
+    return enqueue_rx(queue, queue_bytes, std::move(item), kMaxQueueBudget);
 }
 
 bool enqueue_rx_front(std::deque<RxItem>& queue, size_t& queue_bytes, RxItem item) {
-    return enqueue_bounded(queue, queue_bytes, std::move(item), true);
+    return enqueue_rx_front(queue, queue_bytes, std::move(item), kMaxQueueBudget);
+}
+
+bool enqueue_rx(std::deque<RxItem>& queue, size_t& queue_bytes, RxItem item, size_t max_queue_budget) {
+    return enqueue_bounded(queue, queue_bytes, std::move(item), false, max_queue_budget);
+}
+
+bool enqueue_rx_front(std::deque<RxItem>& queue, size_t& queue_bytes, RxItem item, size_t max_queue_budget) {
+    return enqueue_bounded(queue, queue_bytes, std::move(item), true, max_queue_budget);
 }
 
 std::optional<TxItem> pop_tx(std::deque<TxItem>& queue, size_t& queue_bytes) {

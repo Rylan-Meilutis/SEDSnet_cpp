@@ -9,7 +9,7 @@ This repo provides:
 - C ABI plus RAII-style C++ wrappers
 - GoogleTest coverage for packet, router, relay, overlay, and C interop behavior
 
-The implementation is generated in part from `telemetry_config.json` and optional IPC overlay schemas.
+The implementation can be seeded from optional runtime schema and IPC overlay schemas. A default build is generic and only includes built-in control types; this repository's tests opt into `tests/schemas/default_test_schema.json` as a fixture.
 Generated build artifacts live under `build/`.
 
 ## Features
@@ -20,6 +20,8 @@ Generated build artifacts live under `build/`.
   announce/request/response packets, discovered source routing, local network-time setters
 - Reliable transport:
   ACK/retransmit support with schema-driven reliable mode metadata
+- Runtime configuration:
+  schema registration/seeding, router/relay memory budgets, device identity, compression threshold, string/binary sizing, float string precision, handler retries, reliable retransmit timing, reliable cache limits, and router address mode are runtime APIs aligned with upstream v4.0.1. `MAX_STACK_PAYLOAD` remains a compile-time capacity because it changes inline payload layout.
 - Link-local overlays:
   side-level isolation for software-bus / IPC-only traffic
 
@@ -54,7 +56,7 @@ That runs:
 - `tests/`
   GoogleTest unit/system tests and codegen checks
 - `tests/schemas/`
-  checked-in schema fixtures for overlay/codegen testing
+  checked-in schema fixtures for tests and codegen verification
 - `scripts/generate_schema.py`
   schema/codegen driver
 - `docs/`

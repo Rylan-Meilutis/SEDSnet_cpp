@@ -1,0 +1,22 @@
+{
+  "endpoints": [
+    {
+      "rust": "EnvBaseEndpoint",
+      "name": "ENV_BASE_ENDPOINT"
+    }
+  ],
+  "types": [
+    {
+      "rust": "EnvBaseType",
+      "name": "ENV_BASE_TYPE",
+      "element": {
+        "kind": "Static",
+        "data_type": "UInt16",
+        "count": 1
+      },
+      "endpoints": [
+        "EnvBaseEndpoint"
+      ]
+    }
+  ]
+}

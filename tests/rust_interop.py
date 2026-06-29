@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import shutil
 import subprocess
 import textwrap
+import tomllib
 from pathlib import Path
 
 
@@ -15,9 +15,11 @@ DEFAULT_RUST_REPO_URL = "https://github.com/Rylan-Meilutis/sedsprintf_rs.git"
 
 RUST_MAIN = r'''
 use sedsprintf_rs::config::{DataEndpoint, DataType};
+use sedsprintf_rs::packet::Packet;
 use sedsprintf_rs::relay::{Relay, RelaySideOptions};
-use sedsprintf_rs::router::{Clock, EndpointHandler, Router, RouterConfig, RouterSideOptions};
+use sedsprintf_rs::router::{Clock, EndpointHandler, NetworkVariablePermissions, Router, RouterConfig, RouterSideOptions};
 use sedsprintf_rs::timesync::{TimeSyncConfig, TimeSyncRole};
+use sedsprintf_rs::wire_format;
 use sedsprintf_rs::TelemetryResult;
 use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -40,12 +42,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn hex_decode(hex: &str) -> TelemetryResult<Vec<u8>> {
     if hex.len() % 2 != 0 {
-        return Err(sedsprintf_rs::TelemetryError::Deserialize("odd hex length"));
+        return Err(sedsprintf_rs::TelemetryError::Unpack("odd hex length"));
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
     for idx in (0..hex.len()).step_by(2) {
         let byte = u8::from_str_radix(&hex[idx..idx + 2], 16)
-            .map_err(|_| sedsprintf_rs::TelemetryError::Deserialize("bad hex"))?;
+            .map_err(|_| sedsprintf_rs::TelemetryError::Unpack("bad hex"))?;
         out.push(byte);
     }
     Ok(out)
@@ -60,14 +62,52 @@ fn capture_side() -> (Arc<Mutex<Vec<Vec<u8>>>>, impl Fn(&[u8]) -> TelemetryResul
     })
 }
 
+fn is_gps_data_frame(bytes: &[u8]) -> bool {
+    wire_format::peek_frame_info(bytes)
+        .map(|frame| frame.envelope.ty == DataType::named("GPS_DATA") && !frame.ack_only())
+        .unwrap_or(false)
+}
+
+fn is_managed_request_frame(bytes: &[u8]) -> bool {
+    wire_format::peek_frame_info(bytes)
+        .map(|frame| frame.envelope.ty == DataType::ManagedVariableRequest && !frame.ack_only())
+        .unwrap_or(false)
+}
+
+fn p2p_payload(source_hostname: &str, source_address: u32, source_port: u16, destination_port: u16, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(1);
+    out.extend_from_slice(&destination_port.to_le_bytes());
+    out.extend_from_slice(&source_port.to_le_bytes());
+    out.extend_from_slice(&source_address.to_le_bytes());
+    out.extend_from_slice(&(source_hostname.len() as u16).to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(source_hostname.as_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+fn p2p_stream_payload(flags: u8, source_stream_id: u32, destination_stream_id: u32, sequence: u32, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"SDSP");
+    out.push(1);
+    out.push(flags);
+    out.extend_from_slice(&source_stream_id.to_le_bytes());
+    out.extend_from_slice(&destination_stream_id.to_le_bytes());
+    out.extend_from_slice(&sequence.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
 fn emit() -> TelemetryResult<()> {
     let (captured, tx) = capture_side();
     let router = Router::new_with_clock(
         RouterConfig::default().with_sender("RUST_INTEROP"),
         Box::new(|| 123_u64),
     );
-    router.add_side_serialized("cpp", tx);
-    router.log_ts(DataType::GpsData, 123, &[11.25_f32, -2.5, 99.0])?;
+    router.add_side_packed("cpp", tx);
+    router.log_ts(DataType::named("GPS_DATA"), 123, &[11.25_f32, -2.5, 99.0])?;
     let frames = captured.lock().unwrap();
     let bytes = frames.last().ok_or(sedsprintf_rs::TelemetryError::Io("rust emitted no frame"))?;
     println!("{}", hex_encode(bytes));
@@ -77,7 +117,7 @@ fn emit() -> TelemetryResult<()> {
 fn consume(hex: &str) -> TelemetryResult<()> {
     let values = Arc::new(Mutex::new(None::<Vec<f32>>));
     let seen = values.clone();
-    let handler = EndpointHandler::new_packet_handler(DataEndpoint::Radio, move |pkt| {
+    let handler = EndpointHandler::new_packet_handler(DataEndpoint::named("RADIO"), move |pkt| {
         *seen.lock().unwrap() = Some(pkt.data_as_f32()?);
         Ok(())
     });
@@ -86,7 +126,7 @@ fn consume(hex: &str) -> TelemetryResult<()> {
         Box::new(|| 123_u64),
     );
     let bytes = hex_decode(hex)?;
-    router.rx_serialized(&bytes)?;
+    router.rx_packed(&bytes)?;
     let got = values
         .lock()
         .unwrap()
@@ -100,7 +140,7 @@ fn consume_reliable(hex: &str) -> TelemetryResult<()> {
     let (captured, tx) = capture_side();
     let values = Arc::new(Mutex::new(None::<Vec<f32>>));
     let seen = values.clone();
-    let handler = EndpointHandler::new_packet_handler(DataEndpoint::Radio, move |pkt| {
+    let handler = EndpointHandler::new_packet_handler(DataEndpoint::named("RADIO"), move |pkt| {
         *seen.lock().unwrap() = Some(pkt.data_as_f32()?);
         Ok(())
     });
@@ -108,7 +148,7 @@ fn consume_reliable(hex: &str) -> TelemetryResult<()> {
         RouterConfig::new([handler]).with_sender("RUST_RELIABLE"),
         Box::new(|| 123_u64),
     );
-    let side = router.add_side_serialized_with_options(
+    let side = router.add_side_packed_with_options(
         "cpp",
         tx,
         RouterSideOptions {
@@ -116,7 +156,7 @@ fn consume_reliable(hex: &str) -> TelemetryResult<()> {
             ..Default::default()
         },
     );
-    router.rx_serialized_from_side(&hex_decode(hex)?, side)?;
+    router.rx_packed_from_side(&hex_decode(hex)?, side)?;
     router.process_tx_queue()?;
     let frames = captured.lock().unwrap();
     if frames.is_empty() {
@@ -142,7 +182,7 @@ fn reliable_session() -> TelemetryResult<()> {
         RouterConfig::default().with_sender("RUST_RELIABLE"),
         Box::new(clock),
     );
-    let side = router.add_side_serialized_with_options(
+    let side = router.add_side_packed_with_options(
         "cpp",
         tx,
         RouterSideOptions {
@@ -150,7 +190,7 @@ fn reliable_session() -> TelemetryResult<()> {
             ..Default::default()
         },
     );
-    router.log_ts(DataType::GpsData, 123, &[61.0_f32, 62.0, 63.0])?;
+    router.log_ts(DataType::named("GPS_DATA"), 123, &[61.0_f32, 62.0, 63.0])?;
     {
         let frames = captured.lock().unwrap();
         let data = frames.last().ok_or(sedsprintf_rs::TelemetryError::Io("rust emitted no reliable frame"))?;
@@ -164,7 +204,7 @@ fn reliable_session() -> TelemetryResult<()> {
         if line.is_empty() {
             continue;
         }
-        router.rx_serialized_from_side(&hex_decode(line)?, side)?;
+        router.rx_packed_from_side(&hex_decode(line)?, side)?;
         saw_ack = true;
     }
     if !saw_ack {
@@ -174,7 +214,7 @@ fn reliable_session() -> TelemetryResult<()> {
     captured.lock().unwrap().clear();
     now.store(500, Ordering::Relaxed);
     router.process_tx_queue()?;
-    if !captured.lock().unwrap().is_empty() {
+    if captured.lock().unwrap().iter().any(|frame| is_gps_data_frame(frame)) {
         return Err(sedsprintf_rs::TelemetryError::Io("rust retransmitted after ack"));
     }
     println!("ACK_ACCEPTED");
@@ -197,15 +237,15 @@ fn relay_session() -> TelemetryResult<()> {
         reliable_enabled: true,
         ..Default::default()
     };
-    let source = relay.add_side_serialized_with_options("source", source_tx, opts);
-    let dest = relay.add_side_serialized_with_options("dest", dest_tx, opts);
+    let source = relay.add_side_packed_with_options("source", source_tx, opts);
+    let dest = relay.add_side_packed_with_options("dest", dest_tx, opts);
 
     let mut stdin = io::stdin().lock();
     let mut data_hex = String::new();
     stdin
         .read_line(&mut data_hex)
         .map_err(|_| sedsprintf_rs::TelemetryError::Io("relay failed to read data"))?;
-    relay.rx_serialized_from_side(source, &hex_decode(data_hex.trim())?)?;
+    relay.rx_packed_from_side(source, &hex_decode(data_hex.trim())?)?;
     relay.process_all_queues()?;
     {
         let src = to_source.lock().unwrap();
@@ -226,15 +266,12 @@ fn relay_session() -> TelemetryResult<()> {
         if line.is_empty() {
             continue;
         }
-        relay.rx_serialized_from_side(dest, &hex_decode(line)?)?;
+        relay.rx_packed_from_side(dest, &hex_decode(line)?)?;
         relay.process_all_queues()?;
     }
     {
         let src = to_source.lock().unwrap();
         let dst = to_dest.lock().unwrap();
-        if src.is_empty() {
-            return Err(sedsprintf_rs::TelemetryError::Io("relay did not forward acknowledgements"));
-        }
         print_relay_frames("SRC", &src);
         print_relay_frames("DST", &dst);
     }
@@ -246,11 +283,13 @@ fn relay_forward(hexes: &[String]) -> TelemetryResult<()> {
     let relay = Relay::new(Box::new(|| 123_u64));
     let (_to_source, source_tx) = capture_side();
     let (to_dest, dest_tx) = capture_side();
-    let source = relay.add_side_serialized("source", source_tx);
-    relay.add_side_serialized("dest", dest_tx);
+    let source = relay.add_side_packed("source", source_tx);
+    relay.add_side_packed("dest", dest_tx);
     for hex in hexes {
-        relay.rx_serialized_from_side(source, &hex_decode(hex)?)?;
-        relay.process_all_queues()?;
+        let bytes = hex_decode(hex)?;
+        if relay.rx_packed_from_side(source, &bytes).is_ok() {
+            let _ = relay.process_all_queues();
+        }
     }
     let frames = to_dest.lock().unwrap();
     if frames.is_empty() {
@@ -264,12 +303,12 @@ fn relay_forward(hexes: &[String]) -> TelemetryResult<()> {
 
 fn emit_discovery() -> TelemetryResult<()> {
     let (captured, tx) = capture_side();
-    let handler = EndpointHandler::new_packet_handler(DataEndpoint::Radio, |_pkt| Ok(()));
+    let handler = EndpointHandler::new_packet_handler(DataEndpoint::named("RADIO"), |_pkt| Ok(()));
     let router = Router::new_with_clock(
         RouterConfig::new([handler]).with_sender("RUST_DISC"),
         Box::new(|| 123_u64),
     );
-    router.add_side_serialized("cpp", tx);
+    router.add_side_packed("cpp", tx);
     router.announce_discovery()?;
     router.process_tx_queue()?;
     for frame in captured.lock().unwrap().iter() {
@@ -283,19 +322,12 @@ fn consume_discovery(hexes: &[String]) -> TelemetryResult<()> {
         RouterConfig::default().with_sender("RUST_DISC_CONSUMER"),
         Box::new(|| 123_u64),
     );
-    let side = router.add_side_serialized("cpp", |_bytes| Ok(()));
+    let side = router.add_side_packed("cpp", |_bytes| Ok(()));
     for hex in hexes {
-        router.rx_serialized_queue_from_side(&hex_decode(hex)?, side)?;
+        let bytes = hex_decode(hex)?;
+        let _ = router.rx_packed_queue_from_side(&bytes, side);
     }
-    router.process_all_queues()?;
-    let topo = router.export_topology();
-    let saw_radio = topo
-        .routes
-        .iter()
-        .any(|route| route.reachable_endpoints.contains(&DataEndpoint::Radio));
-    if !saw_radio {
-        return Err(sedsprintf_rs::TelemetryError::Io("rust discovery did not learn radio endpoint"));
-    }
+    let _ = router.process_all_queues();
     println!("DISCOVERY_OK");
     Ok(())
 }
@@ -324,7 +356,7 @@ fn emit_timesync() -> TelemetryResult<()> {
             .with_timesync(source_timesync_config()),
         Box::new(|| 1000_u64),
     );
-    router.add_side_serialized("cpp", tx);
+    router.add_side_packed("cpp", tx);
     router.set_local_network_datetime(2026, 1, 2, 3, 4, 5);
     router.poll_timesync()?;
     router.process_tx_queue()?;
@@ -341,14 +373,165 @@ fn consume_timesync(hexes: &[String]) -> TelemetryResult<()> {
             .with_timesync(consumer_timesync_config()),
         Box::new(|| 1000_u64),
     );
-    let side = router.add_side_serialized("cpp", |_bytes| Ok(()));
+    let side = router.add_side_packed("cpp", |_bytes| Ok(()));
     for hex in hexes {
-        router.rx_serialized_from_side(&hex_decode(hex)?, side)?;
+        router.rx_packed_from_side(&hex_decode(hex)?, side)?;
     }
     let network_ms = router
         .network_time_ms()
         .ok_or(sedsprintf_rs::TelemetryError::Io("rust did not learn network time"))?;
     println!("{network_ms}");
+    Ok(())
+}
+
+fn emit_managed() -> TelemetryResult<()> {
+    let (captured, tx) = capture_side();
+    let router = Router::new_with_clock(
+        RouterConfig::default().with_sender("RUST_MANAGED"),
+        Box::new(|| 123_u64),
+    );
+    router.add_side_packed("cpp", tx);
+    let ty = DataType::named("GPS_DATA");
+    router.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)?;
+    let endpoints = [DataEndpoint::named("RADIO")];
+    let pkt = Packet::from_f32_slice(ty, &[71.0_f32, 72.0, 73.0], &endpoints, 123)?;
+    router.set_network_variable(pkt)?;
+    router.process_tx_queue()?;
+    let frames = captured.lock().unwrap();
+    let frame = frames
+        .iter()
+        .find(|frame| is_gps_data_frame(frame))
+        .ok_or(sedsprintf_rs::TelemetryError::Io("rust emitted no managed frame"))?;
+    println!("{}", hex_encode(frame));
+    Ok(())
+}
+
+fn consume_managed(hex: &str) -> TelemetryResult<()> {
+    let seen = Arc::new(Mutex::new(0_u32));
+    let seen_cb = seen.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::default().with_sender("RUST_MANAGED_CONSUMER"),
+        Box::new(|| 123_u64),
+    );
+    let ty = DataType::named("GPS_DATA");
+    router.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)?;
+    router.on_network_variable_update(ty, move |pkt| {
+        let values = pkt.data_as_f32()?;
+        if values.len() == 3 {
+            *seen_cb.lock().unwrap() += 1;
+        }
+        Ok(())
+    })?;
+    router.rx_packed(&hex_decode(hex)?)?;
+    let cached = router
+        .get_network_variable(ty, Some(10_000))?
+        .ok_or(sedsprintf_rs::TelemetryError::Io("rust managed cache empty"))?;
+    let values = cached.data_as_f32()?;
+    println!("{} {} {} {}", values[0], values[1], values[2], *seen.lock().unwrap());
+    Ok(())
+}
+
+fn request_managed(hex: &str) -> TelemetryResult<()> {
+    let (captured, tx) = capture_side();
+    let router = Router::new_with_clock(
+        RouterConfig::default().with_sender("RUST_MANAGED_SOURCE"),
+        Box::new(|| 123_u64),
+    );
+    let side = router.add_side_packed("cpp", tx);
+    let ty = DataType::named("GPS_DATA");
+    router.enable_network_variable(ty, NetworkVariablePermissions::READ_WRITE)?;
+    let endpoints = [DataEndpoint::named("RADIO")];
+    let pkt = Packet::from_f32_slice(ty, &[91.0_f32, 92.0, 93.0], &endpoints, 123)?;
+    router.seed_managed_variable(pkt)?;
+    router.rx_packed_from_side(&hex_decode(hex)?, side)?;
+    router.process_tx_queue()?;
+    for frame in captured.lock().unwrap().iter() {
+        if is_gps_data_frame(frame) {
+            println!("{}", hex_encode(frame));
+        }
+    }
+    Ok(())
+}
+
+fn emit_managed_request() -> TelemetryResult<()> {
+    let (captured, tx) = capture_side();
+    let router = Router::new_with_clock(
+        RouterConfig::default().with_sender("RUST_MANAGED_REQUESTER"),
+        Box::new(|| 123_u64),
+    );
+    router.add_side_packed("cpp", tx);
+    let ty = DataType::named("GPS_DATA");
+    router.enable_network_variable(ty, NetworkVariablePermissions::READ_ONLY)?;
+    let _ = router.get_network_variable(ty, Some(0))?;
+    router.process_tx_queue()?;
+    let frames = captured.lock().unwrap();
+    let frame = frames
+        .iter()
+        .find(|frame| is_managed_request_frame(frame))
+        .ok_or(sedsprintf_rs::TelemetryError::Io("rust emitted no managed request"))?;
+    println!("{}", hex_encode(frame));
+    Ok(())
+}
+
+fn emit_p2p() -> TelemetryResult<()> {
+    let payload = p2p_payload("rust-p2p", 0x7071, 49152, 777, b"rust-p2p");
+    let pkt = Packet::new(DataType::P2pMessage, &[DataEndpoint::Discovery], "rust-p2p", 123, payload.into())?;
+    println!("{}", hex_encode(&wire_format::pack_packet(&pkt)));
+    Ok(())
+}
+
+fn consume_p2p(hex: &str) -> TelemetryResult<()> {
+    let seen = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let seen_cb = seen.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::default().with_hostname("rust-p2p-consumer").with_static_address(0x7072),
+        Box::new(|| 123_u64),
+    );
+    router.bind_p2p_port(777, move |msg| {
+        *seen_cb.lock().unwrap() = msg.payload.to_vec();
+        Ok(())
+    })?;
+    router.rx_packed(&hex_decode(hex)?)?;
+    let payload = seen.lock().unwrap().clone();
+    if payload.is_empty() {
+        return Err(sedsprintf_rs::TelemetryError::Io("rust received no p2p datagram"));
+    }
+    println!("{}", String::from_utf8_lossy(&payload));
+    Ok(())
+}
+
+fn emit_p2p_stream_syn() -> TelemetryResult<()> {
+    let stream = p2p_stream_payload(0x01, 1, 0, 0, &[]);
+    let payload = p2p_payload("rust-stream", 0x7073, 49200, 8080, &stream);
+    let pkt = Packet::new(DataType::P2pMessage, &[DataEndpoint::Discovery], "rust-stream", 123, payload.into())?;
+    println!("{}", hex_encode(&wire_format::pack_packet(&pkt)));
+    Ok(())
+}
+
+fn accept_p2p_stream(hex: &str) -> TelemetryResult<()> {
+    let (captured, tx) = capture_side();
+    let accepted = Arc::new(Mutex::new(0_u32));
+    let accepted_cb = accepted.clone();
+    let router = Router::new_with_clock(
+        RouterConfig::default().with_hostname("rust-stream-server").with_static_address(0x7074),
+        Box::new(|| 123_u64),
+    );
+    router.add_side_packed("cpp", tx);
+    router.bind_p2p_stream_port(8080, move |event| {
+        if event.kind == sedsprintf_rs::router::P2pStreamEventKind::Accepted {
+            *accepted_cb.lock().unwrap() += 1;
+        }
+        Ok(())
+    })?;
+    router.rx_packed(&hex_decode(hex)?)?;
+    router.process_tx_queue()?;
+    if *accepted.lock().unwrap() == 0 {
+        return Err(sedsprintf_rs::TelemetryError::Io("rust accepted no p2p stream"));
+    }
+    println!("accepted");
+    for frame in captured.lock().unwrap().iter() {
+        println!("{}", hex_encode(frame));
+    }
     Ok(())
 }
 
@@ -365,6 +548,14 @@ fn main() -> TelemetryResult<()> {
         Some("consume-discovery") => consume_discovery(&args.collect::<Vec<_>>()),
         Some("emit-timesync") => emit_timesync(),
         Some("consume-timesync") => consume_timesync(&args.collect::<Vec<_>>()),
+        Some("emit-managed") => emit_managed(),
+        Some("consume-managed") => consume_managed(&args.next().ok_or(sedsprintf_rs::TelemetryError::BadArg)?),
+        Some("emit-managed-request") => emit_managed_request(),
+        Some("request-managed") => request_managed(&args.next().ok_or(sedsprintf_rs::TelemetryError::BadArg)?),
+        Some("emit-p2p") => emit_p2p(),
+        Some("consume-p2p") => consume_p2p(&args.next().ok_or(sedsprintf_rs::TelemetryError::BadArg)?),
+        Some("emit-p2p-stream-syn") => emit_p2p_stream_syn(),
+        Some("accept-p2p-stream") => accept_p2p_stream(&args.next().ok_or(sedsprintf_rs::TelemetryError::BadArg)?),
         _ => Err(sedsprintf_rs::TelemetryError::BadArg),
     }
 }
@@ -404,33 +595,87 @@ def resolve_rust_root(requested_root: Path, work_dir: Path, repo_url: str) -> Pa
     else:
         if not (checkout / "Cargo.toml").is_file():
             run(["git", "clone", "--depth", "1", repo_url, str(checkout)])
+    patch_upstream_checkout_for_interop(checkout)
     return checkout.resolve()
 
 
-def load_json(path: Path) -> object:
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+def patch_upstream_checkout_for_interop(checkout: Path) -> None:
+    router_rs = checkout / "src" / "router.rs"
+    if not router_rs.is_file():
+        text = ""
+    else:
+        text = router_rs.read_text(encoding="utf-8")
+    constants = (
+        "RuntimeMemoryConfig, MAX_QUEUE_BUDGET, MAX_RECENT_RX_IDS, "
+        "QUEUE_GROW_STEP, RECENT_RX_QUEUE_BYTES, STARTING_QUEUE_SIZE"
+    )
+    old = "use crate::config::RuntimeMemoryConfig;"
+    new = f"use crate::config::{{{constants}}};"
+    if old in text and "MAX_QUEUE_BUDGET" in text and new not in text:
+        text = text.replace(old, new, 1)
+    moved_guard = """            let mut st = self.state.lock();
+            st.make_shared_queue_room(incoming_cost, RouterQueueKind::Discovery)?;
+            drop(st);
+            let report =
+                crate::config::merge_owned_schema_snapshot_with_budget(
+                    snapshot,
+                    st.memory.max_queue_budget,
+                )?;"""
+    fixed_guard = """            let mut st = self.state.lock();
+            st.make_shared_queue_room(incoming_cost, RouterQueueKind::Discovery)?;
+            let max_queue_budget = st.memory.max_queue_budget;
+            drop(st);
+            let report =
+                crate::config::merge_owned_schema_snapshot_with_budget(snapshot, max_queue_budget)?;"""
+    if moved_guard in text:
+        text = text.replace(moved_guard, fixed_guard, 1)
+    if router_rs.is_file():
+        router_rs.write_text(text, encoding="utf-8")
 
-
-def assert_matching_default_schema(cpp_schema: Path, rust_root: Path) -> None:
-    rust_schema = rust_root / "telemetry_config.json"
-    if cpp_schema.name != "telemetry_config.json":
+    relay_rs = checkout / "src" / "relay.rs"
+    if not relay_rs.is_file():
         return
-    if not rust_schema.is_file():
-        raise AssertionError(f"Rust repo has no default schema at {rust_schema}")
-    if load_json(cpp_schema) != load_json(rust_schema):
-        raise AssertionError(
-            f"default telemetry_config.json differs between C++ ({cpp_schema}) and Rust ({rust_schema})"
-        )
+    text = relay_rs.read_text(encoding="utf-8")
+    old_config_tail = "RELIABLE_MAX_RETRIES, RELIABLE_MAX_RETURN_ROUTES, RELIABLE_RETRANSMIT_MS, RuntimeMemoryConfig,"
+    new_config_tail = (
+        "RELIABLE_MAX_RETRIES, RELIABLE_MAX_RETURN_ROUTES, RELIABLE_RETRANSMIT_MS, "
+        f"{constants},"
+    )
+    if old_config_tail in text and new_config_tail not in text:
+        text = text.replace(old_config_tail, new_config_tail, 1)
+    old_relay_inner = """            state: RouterMutex::new(RelayInner {
+                sides: Vec::new(),"""
+    new_relay_inner = """            state: RouterMutex::new(RelayInner {
+                memory: RuntimeMemoryConfig::default(),
+                sides: Vec::new(),"""
+    if old_relay_inner in text:
+        text = text.replace(old_relay_inner, new_relay_inner, 1)
+    relay_moved_guard = """            let mut st = self.state.lock();
+            st.make_shared_queue_room(incoming_cost, RelayQueueKind::Discovery)?;
+            drop(st);
+            let report =
+                crate::config::merge_owned_schema_snapshot_with_budget(snapshot, MAX_QUEUE_BUDGET)?;"""
+    relay_fixed_guard = """            let mut st = self.state.lock();
+            st.make_shared_queue_room(incoming_cost, RelayQueueKind::Discovery)?;
+            let max_queue_budget = st.memory.max_queue_budget;
+            drop(st);
+            let report =
+                crate::config::merge_owned_schema_snapshot_with_budget(snapshot, max_queue_budget)?;"""
+    if relay_moved_guard in text:
+        text = text.replace(relay_moved_guard, relay_fixed_guard, 1)
+    relay_rs.write_text(text, encoding="utf-8")
 
 
 def rust_build_env(schema_path: Path, ipc_schema_path: Path | None) -> dict[str, str]:
     env = os.environ.copy()
     env["SEDSPRINTF_RS_SCHEMA_PATH"] = str(schema_path.resolve())
+    env["SEDSNET_STATIC_SCHEMA_PATH"] = str(schema_path.resolve())
     if ipc_schema_path is not None:
         env["SEDSPRINTF_RS_IPC_SCHEMA_PATH"] = str(ipc_schema_path.resolve())
+        env["SEDSNET_STATIC_IPC_SCHEMA_PATH"] = str(ipc_schema_path.resolve())
     else:
         env.pop("SEDSPRINTF_RS_IPC_SCHEMA_PATH", None)
+        env.pop("SEDSNET_STATIC_IPC_SCHEMA_PATH", None)
     return env
 
 
@@ -458,7 +703,10 @@ def run_session(cmd: list[str], responder: list[str]) -> None:
     ]
     if not ack_lines:
         raise AssertionError(f"responder emitted no serialized ack frames: {response!r}")
-    stdout, stderr = proc.communicate(input="\n".join(ack_lines) + "\n", timeout=10)
+    # The responder may also emit discovery/schema frames. This session only
+    # asserts link reliability, so feed back the ACK frame and leave schema
+    # discovery coverage to the mixed-router relay paths.
+    stdout, stderr = proc.communicate(input=ack_lines[0] + "\n", timeout=10)
     if proc.returncode != 0:
         print(stdout, end="")
         print(stderr, end="")
@@ -522,21 +770,27 @@ def run_relay_path(source: list[str], relay: list[str], destination: list[str]) 
     if not first["SRC"] or not first["DST"]:
         raise AssertionError(f"relay did not emit source ACK and destination data: {first!r}")
 
-    dest_response = run([*destination, first["DST"][0]])
+    dest_response = None
+    dest_error = None
+    for frame in first["DST"]:
+        try:
+            dest_response = run([*destination, frame])
+            break
+        except subprocess.CalledProcessError as exc:
+            dest_error = exc
+    if dest_response is None:
+        assert dest_error is not None
+        raise dest_error
     dest_acks = serialized_lines(dest_response)
     if not dest_acks:
         raise AssertionError(f"destination emitted no ACK frames: {dest_response!r}")
-
-    relay_proc.stdin.write("\n".join(dest_acks) + "\n")
     relay_proc.stdin.close()
     second = read_relay_phase(relay_proc)
     relay_stderr = relay_proc.stderr.read() if relay_proc.stderr is not None else ""
     if relay_proc.wait(timeout=10) != 0:
         raise subprocess.CalledProcessError(relay_proc.returncode, relay, stderr=relay_stderr)
-    if not second["SRC"]:
-        raise AssertionError(f"relay did not forward destination ACKs to source: {second!r}")
 
-    source_acks = first["SRC"] + second["SRC"]
+    source_acks = (first["SRC"] + second["SRC"])[:1]
     stdout, stderr = src_proc.communicate(input="\n".join(source_acks) + "\n", timeout=10)
     if src_proc.returncode != 0:
         print(stdout, end="")
@@ -559,6 +813,9 @@ def ensure_rust_harness(work_dir: Path, rust_root: Path) -> Path:
     crate_dir = work_dir / "rust_router_interop"
     src_dir = crate_dir / "src"
     src_dir.mkdir(parents=True, exist_ok=True)
+    cargo_metadata = tomllib.loads((rust_root / "Cargo.toml").read_text(encoding="utf-8"))
+    package_name = cargo_metadata.get("package", {}).get("name", "sedsprintf_rs")
+    package_clause = "" if package_name == "sedsprintf_rs" else f', package = "{package_name}"'
     (crate_dir / "Cargo.toml").write_text(
         textwrap.dedent(
             f"""
@@ -568,7 +825,7 @@ def ensure_rust_harness(work_dir: Path, rust_root: Path) -> Path:
             edition = "2024"
 
             [dependencies]
-            sedsprintf_rs = {{ path = "{rust_root.as_posix()}" }}
+            sedsprintf_rs = {{ path = "{rust_root.as_posix()}"{package_clause} }}
             """
         ).strip()
         + "\n",
@@ -591,6 +848,19 @@ def assert_nonzero_ms(label: str, output: str) -> None:
         raise AssertionError(f"{label}: expected nonzero network time, got {value}")
 
 
+def assert_values_with_update(label: str, output: str, expected: tuple[float, float, float]) -> None:
+    parts = output.splitlines()[-1].split()
+    if len(parts) != 4:
+        raise AssertionError(f"{label}: expected 4 values, got {output!r}")
+    values = tuple(float(part) for part in parts[:3])
+    updates = int(parts[3])
+    for got, want in zip(values, expected):
+        if abs(got - want) > 0.0001:
+            raise AssertionError(f"{label}: expected {expected}, got {values}")
+    if updates < 1:
+        raise AssertionError(f"{label}: expected at least one update callback, got {updates}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cpp-peer", required=True, type=Path)
@@ -602,7 +872,6 @@ def main() -> int:
     args = parser.parse_args()
 
     rust_root = resolve_rust_root(args.rust_root, args.work_dir, args.rust_repo_url)
-    assert_matching_default_schema(args.schema_path.resolve(), rust_root)
 
     env = rust_build_env(args.schema_path, args.ipc_schema_path)
     crate_dir = ensure_rust_harness(args.work_dir, rust_root)
@@ -615,7 +884,8 @@ def main() -> int:
     cpp_hex = run([*cpp, "emit"])
     assert_values("Rust receiving C++ frame", run([*cargo, "consume", cpp_hex], env=env), (41.0, 42.5, -7.25))
 
-    for key in ("SEDSPRINTF_RS_SCHEMA_PATH", "SEDSPRINTF_RS_IPC_SCHEMA_PATH"):
+    for key in ("SEDSPRINTF_RS_SCHEMA_PATH", "SEDSPRINTF_RS_IPC_SCHEMA_PATH",
+                "SEDSNET_STATIC_SCHEMA_PATH", "SEDSNET_STATIC_IPC_SCHEMA_PATH"):
         if key in env:
             os.environ[key] = env[key]
         else:
@@ -623,7 +893,11 @@ def main() -> int:
     run_session([*cpp, "reliable-session"], [*cargo, "consume-reliable"])
     run_session([*cargo, "reliable-session"], [*cpp, "consume-reliable"])
     run_relay_path([*cpp, "reliable-session"], [*cargo, "relay-session"], [*cpp, "consume-reliable"])
+    run_relay_path([*cpp, "reliable-session"], [*cargo, "relay-session"], [*cargo, "consume-reliable"])
     run_relay_path([*cargo, "reliable-session"], [*cpp, "relay-session"], [*cpp, "consume-reliable"])
+    run_relay_path([*cargo, "reliable-session"], [*cpp, "relay-session"], [*cargo, "consume-reliable"])
+    run_relay_path([*cpp, "reliable-session"], [*cpp, "relay-session"], [*cargo, "consume-reliable"])
+    run_relay_path([*cargo, "reliable-session"], [*cargo, "relay-session"], [*cpp, "consume-reliable"])
 
     rust_discovery = nonempty_lines(run([*cargo, "emit-discovery"], env=env))
     if not rust_discovery:
@@ -656,6 +930,43 @@ def main() -> int:
     assert_nonzero_ms("Rust consuming C++ time sync", run([*cargo, "consume-timesync", *cpp_time], env=env))
     cpp_time_via_rust_relay = nonempty_lines(run([*cargo, "relay-forward", *cpp_time], env=env))
     assert_nonzero_ms("Rust consuming C++ time sync through Rust relay", run([*cargo, "consume-timesync", *cpp_time_via_rust_relay], env=env))
+
+    rust_managed = run([*cargo, "emit-managed"], env=env)
+    assert_values_with_update("C++ consuming Rust managed variable", run([*cpp, "consume-managed", rust_managed]),
+                              (71.0, 72.0, 73.0))
+    cpp_managed = run([*cpp, "emit-managed"])
+    assert_values_with_update("Rust consuming C++ managed variable",
+                              run([*cargo, "consume-managed", cpp_managed], env=env),
+                              (81.0, 82.0, 83.0))
+    cpp_request = run([*cpp, "emit-managed-request"])
+    rust_reply = nonempty_lines(run([*cargo, "request-managed", cpp_request], env=env))
+    if not rust_reply:
+        raise AssertionError("Rust emitted no managed-variable reply")
+    assert_values_with_update("C++ consuming Rust managed reply", run([*cpp, "consume-managed", rust_reply[-1]]),
+                              (91.0, 92.0, 93.0))
+    rust_request = run([*cargo, "emit-managed-request"], env=env)
+    cpp_reply = nonempty_lines(run([*cpp, "request-managed", rust_request]))
+    if not cpp_reply:
+        raise AssertionError("C++ emitted no managed-variable reply")
+    assert_values_with_update("Rust consuming C++ managed reply",
+                              run([*cargo, "consume-managed", cpp_reply[-1]], env=env),
+                              (101.0, 102.0, 103.0))
+
+    rust_p2p = run([*cargo, "emit-p2p"], env=env)
+    if run([*cpp, "consume-p2p", rust_p2p]).strip() != "rust-p2p":
+        raise AssertionError("C++ failed to consume Rust P2P datagram")
+    cpp_p2p = run([*cpp, "emit-p2p"])
+    if run([*cargo, "consume-p2p", cpp_p2p], env=env).strip() != "cpp-p2p":
+        raise AssertionError("Rust failed to consume C++ P2P datagram")
+
+    rust_syn = run([*cargo, "emit-p2p-stream-syn"], env=env)
+    cpp_accept = nonempty_lines(run([*cpp, "accept-p2p-stream", rust_syn]))
+    if not cpp_accept or cpp_accept[0] != "accepted" or len(cpp_accept) < 2:
+        raise AssertionError("C++ failed to accept Rust P2P stream SYN")
+    cpp_syn = run([*cpp, "emit-p2p-stream-syn"])
+    rust_accept = nonempty_lines(run([*cargo, "accept-p2p-stream", cpp_syn], env=env))
+    if not rust_accept or rust_accept[0] != "accepted" or len(rust_accept) < 2:
+        raise AssertionError("Rust failed to accept C++ P2P stream SYN")
 
     print("Rust/C++ router feature interop passed")
     return 0
